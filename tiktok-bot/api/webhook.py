@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 import requests
 from flask import Flask, request, jsonify
@@ -13,14 +14,21 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-YDL_OPTS = {
+YDL_API_HOSTNAMES = [
+    "api16-normal-c-useast1a.tiktokv.com",
+    "api22-normal-c-useast1a.tiktokv.com",
+    "api22-normal-c-alisg.tiktokv.com",
+    "api16-normal-c-alisg.tiktokv.com",
+]
+
+YDL_BASE_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "skip_download": True,
     "noplaylist": True,
     "extract_flat": False,
     "format": "best",
-    "socket_timeout": 8,
+    "socket_timeout": 10,
     "retries": 1,
     "http_headers": {
         "User-Agent": (
@@ -29,15 +37,20 @@ YDL_OPTS = {
             "Chrome/120.0.0.0 Mobile Safari/537.36"
         )
     },
-    "extractor_args": {
+}
+
+
+def _ydl_opts(hostname: str) -> dict:
+    opts = dict(YDL_BASE_OPTS)
+    opts["extractor_args"] = {
         "tiktok": {
-            "api_hostname": ["api22-normal-c-useast1a.tiktokv.com"],
+            "api_hostname": [hostname],
             "app_name": ["musical_ly"],
             "app_version": ["34.1.2"],
             "manifest_app_version": ["2023401020"],
         }
-    },
-}
+    }
+    return opts
 
 TIKWM_ENDPOINTS = [
     "https://www.tikwm.com/api/",
@@ -100,9 +113,8 @@ def is_tiktok_url(text: str) -> bool:
     ])
 
 
-def _extract_via_tikwm(url: str) -> dict:
-    """Primary extractor: TikWM API. Reliable, returns HD no-watermark URLs."""
-    last_err = None
+def _tikwm_call(url: str) -> dict | None:
+    """Single call to TikWM. Returns parsed media dict or None on failure."""
     for endpoint in TIKWM_ENDPOINTS:
         try:
             r = requests.post(
@@ -112,16 +124,16 @@ def _extract_via_tikwm(url: str) -> dict:
                 timeout=12,
             )
             if r.status_code != 200:
-                last_err = f"http {r.status_code}"
                 continue
             data = r.json()
             if data.get("code") != 0 or not data.get("data"):
-                last_err = data.get("msg") or "no data"
+                msg = (data.get("msg") or "").lower()
+                if "limit" in msg or "rate" in msg or "frequen" in msg:
+                    return {"_rate_limited": True}
                 continue
 
             d = data["data"]
 
-            # Slideshow (images) — TikWM returns "images" array
             images = d.get("images") or []
             if images:
                 return {
@@ -130,11 +142,6 @@ def _extract_via_tikwm(url: str) -> dict:
                     "title": d.get("title") or "",
                 }
 
-            # Smart HD selection:
-            # - hd_size > play_size  → hdplay is true H.264 HD (bigger file = HD).
-            # - hd_size < play_size  → hdplay is HEVC/H.265 (smaller despite HD due
-            #                           to better compression). Skip it because many
-            #                           Telegram clients render HEVC as black screen.
             play_url = d.get("play")
             hd_url = d.get("hdplay")
             wm_url = d.get("wmplay")
@@ -143,7 +150,7 @@ def _extract_via_tikwm(url: str) -> dict:
 
             video_url = None
             if hd_url and hd_size and play_size and hd_size > play_size * 1.15:
-                video_url = hd_url  # genuine H.264 HD
+                video_url = hd_url
             elif play_url:
                 video_url = play_url
             elif hd_url:
@@ -161,19 +168,83 @@ def _extract_via_tikwm(url: str) -> dict:
                     "height": 0,
                     "thumbnail": d.get("cover") or d.get("origin_cover"),
                 }
-            last_err = "no video url"
-        except Exception as e:
-            last_err = str(e)
+        except Exception:
             continue
-    raise RuntimeError(f"tikwm: {last_err}")
+    return None
+
+
+def _extract_via_tikwm(url: str) -> dict:
+    """Fallback extractor: TikWM API. Returns no-watermark URLs.
+    Retries up to 2 times on rate-limit (free tier allows 1 req/sec).
+    """
+    for attempt in range(3):
+        result = _tikwm_call(url)
+        if result is None:
+            raise RuntimeError("tikwm: no result")
+        if result.get("_rate_limited"):
+            time.sleep(1.5)
+            continue
+        if result.get("type") in ("video", "images"):
+            return result
+        raise RuntimeError("tikwm: unknown response")
+    raise RuntimeError("tikwm: rate-limited after retries")
+
+
+def _is_h264(vcodec: str) -> bool:
+    if not vcodec:
+        return False
+    v = vcodec.lower()
+    return "avc" in v or "h264" in v or v.startswith("h.264")
+
+
+def _pick_best_format(formats: list) -> dict | None:
+    """Pick the best video format from yt-dlp.
+
+    Strategy: prefer the highest resolution. If two formats share a resolution,
+    prefer H.264 (universally compatible with Telegram's preview player) over
+    HEVC. Within the same codec, prefer higher bitrate.
+    """
+    candidates = [
+        f for f in formats
+        if f.get("url") and f.get("vcodec") and f.get("vcodec") != "none"
+    ]
+    if not candidates:
+        return None
+
+    def score(f):
+        return (
+            f.get("height") or 0,
+            1 if _is_h264(f.get("vcodec") or "") else 0,
+            f.get("tbr") or 0,
+        )
+
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
 
 
 def _extract_via_ytdlp(url: str) -> dict:
-    """Fallback extractor: yt-dlp."""
-    with YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
+    """Primary extractor: yt-dlp picks the highest resolution available.
+
+    For TikTok videos this is usually 720p HEVC, which Telegram modern clients
+    handle well when we pass width/height/duration metadata explicitly.
+    Tries multiple TikTok API hostnames since some get rate-limited per IP.
+    """
+    info = None
+    last_err = None
+    for hostname in YDL_API_HOSTNAMES:
+        try:
+            with YoutubeDL(_ydl_opts(hostname)) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info and (info.get("formats") or info.get("url") or info.get("entries")):
+                break
+        except Exception as e:
+            last_err = e
+            info = None
+            continue
 
     if not info:
+        if last_err:
+            raise last_err
         return {"type": "none"}
 
     # Slideshow / images
@@ -203,31 +274,26 @@ def _extract_via_ytdlp(url: str) -> dict:
                 "title": info.get("title") or "",
             }
 
-    video_url = None
-    formats = info.get("formats") or []
-    if formats:
-        def _key(f):
-            return (
-                f.get("height") or 0,
-                f.get("tbr") or 0,
-                1 if (f.get("ext") == "mp4") else 0,
-            )
-        candidates = [f for f in formats if f.get("url") and f.get("vcodec") != "none"]
-        if candidates:
-            candidates.sort(key=_key, reverse=True)
-            video_url = candidates[0].get("url")
-
-    if not video_url:
-        video_url = info.get("url")
-
-    if video_url:
+    best = _pick_best_format(info.get("formats") or [])
+    if best:
         return {
             "type": "video",
-            "url": video_url,
+            "url": best.get("url"),
             "title": info.get("title") or "",
-            "duration": info.get("duration") or 0,
-            "width": info.get("width") or 0,
-            "height": info.get("height") or 0,
+            "duration": int(info.get("duration") or 0),
+            "width": int(best.get("width") or info.get("width") or 0),
+            "height": int(best.get("height") or info.get("height") or 0),
+            "thumbnail": info.get("thumbnail"),
+        }
+
+    if info.get("url"):
+        return {
+            "type": "video",
+            "url": info.get("url"),
+            "title": info.get("title") or "",
+            "duration": int(info.get("duration") or 0),
+            "width": int(info.get("width") or 0),
+            "height": int(info.get("height") or 0),
             "thumbnail": info.get("thumbnail"),
         }
 
@@ -237,20 +303,24 @@ def _extract_via_ytdlp(url: str) -> dict:
 def extract_media(url: str) -> dict:
     """Extract direct media URLs without downloading.
 
-    Strategy: try the reliable TikWM API first (fast, HD, no-watermark, supports
-    slideshows). If that fails for any reason, fall back to yt-dlp.
+    Strategy:
+      1) yt-dlp first — gives access to the highest available resolution
+         (usually 720p HEVC for TikTok), with full width/height/duration
+         metadata so Telegram does not re-encode.
+      2) TikWM API as fallback — fast and reliable, handy if yt-dlp fails
+         due to TikTok extractor changes. Returns 540p H.264.
     """
     try:
-        result = _extract_via_tikwm(url)
+        result = _extract_via_ytdlp(url)
         if result and result.get("type") in ("video", "images"):
             return result
     except Exception as e:
-        logger.warning(f"TikWM extractor failed, falling back to yt-dlp: {e}")
+        logger.warning(f"yt-dlp extractor failed, falling back to TikWM: {e}")
 
     try:
-        return _extract_via_ytdlp(url)
+        return _extract_via_tikwm(url)
     except Exception as e:
-        logger.error(f"yt-dlp extractor failed: {e}")
+        logger.error(f"TikWM extractor failed: {e}")
         raise
 
 
