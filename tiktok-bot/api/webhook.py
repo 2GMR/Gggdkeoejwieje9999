@@ -130,25 +130,35 @@ def _extract_via_tikwm(url: str) -> dict:
                     "title": d.get("title") or "",
                 }
 
-            # Video URL priority:
-            #   1) "play"   → standard no-watermark H.264 (most reliable on Telegram).
-            #   2) "hdplay" → HD but often HEVC/H.265 which causes black-screen
-            #                 previews on many Telegram clients, so we skip it
-            #                 unless "play" is missing.
-            #   3) "wmplay" → with watermark (last resort).
-            video_url = d.get("play") or d.get("hdplay") or d.get("wmplay")
+            # Smart HD selection:
+            # - hd_size > play_size  → hdplay is true H.264 HD (bigger file = HD).
+            # - hd_size < play_size  → hdplay is HEVC/H.265 (smaller despite HD due
+            #                           to better compression). Skip it because many
+            #                           Telegram clients render HEVC as black screen.
+            play_url = d.get("play")
+            hd_url = d.get("hdplay")
+            wm_url = d.get("wmplay")
+            play_size = d.get("size") or 0
+            hd_size = d.get("hd_size") or 0
+
+            video_url = None
+            if hd_url and hd_size and play_size and hd_size > play_size * 1.15:
+                video_url = hd_url  # genuine H.264 HD
+            elif play_url:
+                video_url = play_url
+            elif hd_url:
+                video_url = hd_url
+            elif wm_url:
+                video_url = wm_url
+
             if video_url:
                 return {
                     "type": "video",
                     "url": video_url,
                     "title": d.get("title") or "",
                     "duration": int(d.get("duration") or 0),
-                    "width": int((d.get("size") or {}).get("width") or 0)
-                    if isinstance(d.get("size"), dict)
-                    else 0,
-                    "height": int((d.get("size") or {}).get("height") or 0)
-                    if isinstance(d.get("size"), dict)
-                    else 0,
+                    "width": 0,
+                    "height": 0,
                     "thumbnail": d.get("cover") or d.get("origin_cover"),
                 }
             last_err = "no video url"
