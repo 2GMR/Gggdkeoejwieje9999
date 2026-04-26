@@ -130,8 +130,13 @@ def _extract_via_tikwm(url: str) -> dict:
                     "title": d.get("title") or "",
                 }
 
-            # Video — prefer HD, then play (no watermark), then wmplay
-            video_url = d.get("hdplay") or d.get("play") or d.get("wmplay")
+            # Video URL priority:
+            #   1) "play"   → standard no-watermark H.264 (most reliable on Telegram).
+            #   2) "hdplay" → HD but often HEVC/H.265 which causes black-screen
+            #                 previews on many Telegram clients, so we skip it
+            #                 unless "play" is missing.
+            #   3) "wmplay" → with watermark (last resort).
+            video_url = d.get("play") or d.get("hdplay") or d.get("wmplay")
             if video_url:
                 return {
                     "type": "video",
