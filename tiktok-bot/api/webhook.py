@@ -18,6 +18,17 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Auto-detect serverless environments where we cannot download/transcode
+# (timeout 10s, no ffmpeg, ephemeral filesystem). On Vercel/Netlify/etc. we
+# fall back to "URL relay" mode: ask TikWM for a no-watermark URL and hand
+# it to Telegram, who fetches it directly. Quality is 540p H.264.
+SERVERLESS_MODE = bool(
+    os.getenv("VERCEL")
+    or os.getenv("NETLIFY")
+    or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+    or os.getenv("SERVERLESS_MODE")
+)
+
 YDL_API_HOSTNAMES = [
     "api16-normal-c-useast1a.tiktokv.com",
     "api22-normal-c-useast1a.tiktokv.com",
@@ -485,14 +496,28 @@ def _extract_via_ytdlp(url: str) -> dict:
 def extract_media(url: str) -> dict:
     """Extract direct media URLs without downloading.
 
-    Strategy:
-      1) Web scraper — reads __UNIVERSAL_DATA_FOR_REHYDRATION__ from the
-         tiktok.com page. Gives access to the FULL bitrateInfo list
-         including 720p HEVC (highest quality TikTok serves). Works from
-         cloud IPs.
+    On serverless (Vercel/Lambda) we go straight to TikWM because we cannot
+    download/transcode anyway — its `play` URL is fetched by Telegram itself
+    and works without a Referer header. Saves precious milliseconds against
+    the 10s timeout.
+
+    On a full server we try in this order:
+      1) Web scraper — full bitrateInfo (720p HEVC, highest quality).
       2) yt-dlp — fallback if the web page format changes.
-      3) TikWM API — last-resort fallback (returns 540p H.264 only).
+      3) TikWM API — last-resort fallback (540p H.264 only).
     """
+    if SERVERLESS_MODE:
+        try:
+            return _extract_via_tikwm(url)
+        except Exception as e:
+            logger.warning(f"TikWM failed in serverless mode: {e}")
+            # fall through to web scraper as a last attempt
+            try:
+                return _extract_via_web(url)
+            except Exception as e2:
+                logger.error(f"web extractor also failed: {e2}")
+                raise
+
     try:
         result = _extract_via_web(url)
         if result and result.get("type") in ("video", "images"):
@@ -779,34 +804,39 @@ def handle_update(update: dict):
 
     if media["type"] == "video":
         res = None
-        tmp_path = None
-        transcoded_path = None
-        upload_path = None
-        try:
-            tmp_path = download_to_tempfile(media)
-            if tmp_path:
-                upload_path = tmp_path
-                # If the source is HEVC, transcode it to H.264 for smooth
-                # playback on every Telegram client. Telegram's web/desktop
-                # clients in particular stutter on HEVC.
-                codec = _probe_video_codec(tmp_path)
-                if codec in ("hevc", "h265"):
-                    send_chat_action(chat_id, "upload_video")
-                    transcoded_path = transcode_to_h264(tmp_path)
-                    if transcoded_path:
-                        upload_path = transcoded_path
 
-                res = send_video_by_file(chat_id, media, upload_path, reply_to=msg_id)
-        finally:
-            for p in (tmp_path, transcoded_path):
-                if p:
-                    try: os.unlink(p)
-                    except Exception: pass
-
-        # Fallback: try sending the URL directly
-        if not res or not res.get("ok"):
-            logger.warning(f"file upload failed, trying URL: {res}")
+        if SERVERLESS_MODE:
+            # Lightweight URL-relay mode (Vercel / Netlify / Lambda).
+            # Telegram fetches the video itself — we never touch the bytes.
+            # Quality is 540p H.264 (TikWM's `play` URL works without Referer).
             res = send_video_by_url(chat_id, media, reply_to=msg_id)
+        else:
+            # Full mode: download → optional HEVC→H.264 transcode → upload.
+            tmp_path = None
+            transcoded_path = None
+            try:
+                tmp_path = download_to_tempfile(media)
+                upload_path = tmp_path
+                if tmp_path:
+                    # If the source is HEVC, transcode to H.264 for smooth
+                    # playback on every Telegram client.
+                    codec = _probe_video_codec(tmp_path)
+                    if codec in ("hevc", "h265"):
+                        send_chat_action(chat_id, "upload_video")
+                        transcoded_path = transcode_to_h264(tmp_path)
+                        if transcoded_path:
+                            upload_path = transcoded_path
+
+                    res = send_video_by_file(chat_id, media, upload_path, reply_to=msg_id)
+            finally:
+                for p in (tmp_path, transcoded_path):
+                    if p:
+                        try: os.unlink(p)
+                        except Exception: pass
+
+            if not res or not res.get("ok"):
+                logger.warning(f"file upload failed, trying URL: {res}")
+                res = send_video_by_url(chat_id, media, reply_to=msg_id)
 
         if not res or not res.get("ok"):
             send_message(
