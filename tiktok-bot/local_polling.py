@@ -60,6 +60,7 @@ def poll():
     delete_webhook()
 
     offset = 0
+    conflict_count = 0
     logger.info("Polling started. Send a TikTok link to your bot in Telegram.")
 
     while True:
@@ -82,10 +83,23 @@ def poll():
             continue
 
         if not data.get("ok"):
+            # 409 Conflict means another instance is polling. Exit so the
+            # workflow restarts cleanly with a single instance.
+            if data.get("error_code") == 409:
+                conflict_count += 1
+                logger.warning(
+                    f"Conflict 409 — another instance is polling ({conflict_count}/3)."
+                )
+                if conflict_count >= 3:
+                    logger.error("Persistent conflict. Exiting so workflow restarts.")
+                    sys.exit(1)
+                time.sleep(3)
+                continue
             logger.error(f"Telegram error: {data}")
             time.sleep(2)
             continue
 
+        conflict_count = 0
         for update in data.get("result", []):
             offset = update["update_id"] + 1
             try:
