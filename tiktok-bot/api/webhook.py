@@ -29,6 +29,28 @@ YDL_OPTS = {
             "Chrome/120.0.0.0 Mobile Safari/537.36"
         )
     },
+    "extractor_args": {
+        "tiktok": {
+            "api_hostname": ["api22-normal-c-useast1a.tiktokv.com"],
+            "app_name": ["musical_ly"],
+            "app_version": ["34.1.2"],
+            "manifest_app_version": ["2023401020"],
+        }
+    },
+}
+
+TIKWM_ENDPOINTS = [
+    "https://www.tikwm.com/api/",
+    "https://tikwm.com/api/",
+]
+TIKWM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 10; SM-G960F) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.tikwm.com/",
 }
 
 WELCOME = (
@@ -78,8 +100,61 @@ def is_tiktok_url(text: str) -> bool:
     ])
 
 
-def extract_media(url: str) -> dict:
-    """Extract direct media URLs without downloading. Returns dict with type and urls."""
+def _extract_via_tikwm(url: str) -> dict:
+    """Primary extractor: TikWM API. Reliable, returns HD no-watermark URLs."""
+    last_err = None
+    for endpoint in TIKWM_ENDPOINTS:
+        try:
+            r = requests.post(
+                endpoint,
+                data={"url": url, "hd": "1"},
+                headers=TIKWM_HEADERS,
+                timeout=12,
+            )
+            if r.status_code != 200:
+                last_err = f"http {r.status_code}"
+                continue
+            data = r.json()
+            if data.get("code") != 0 or not data.get("data"):
+                last_err = data.get("msg") or "no data"
+                continue
+
+            d = data["data"]
+
+            # Slideshow (images) — TikWM returns "images" array
+            images = d.get("images") or []
+            if images:
+                return {
+                    "type": "images",
+                    "urls": list(images),
+                    "title": d.get("title") or "",
+                }
+
+            # Video — prefer HD, then play (no watermark), then wmplay
+            video_url = d.get("hdplay") or d.get("play") or d.get("wmplay")
+            if video_url:
+                return {
+                    "type": "video",
+                    "url": video_url,
+                    "title": d.get("title") or "",
+                    "duration": int(d.get("duration") or 0),
+                    "width": int((d.get("size") or {}).get("width") or 0)
+                    if isinstance(d.get("size"), dict)
+                    else 0,
+                    "height": int((d.get("size") or {}).get("height") or 0)
+                    if isinstance(d.get("size"), dict)
+                    else 0,
+                    "thumbnail": d.get("cover") or d.get("origin_cover"),
+                }
+            last_err = "no video url"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"tikwm: {last_err}")
+
+
+def _extract_via_ytdlp(url: str) -> dict:
+    """Fallback extractor: yt-dlp."""
     with YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -103,7 +178,6 @@ def extract_media(url: str) -> dict:
                 "title": info.get("title") or "",
             }
 
-    # Some TikTok image posts expose images via "thumbnails" without entries
     if info.get("vcodec") == "none" or (not info.get("url") and info.get("thumbnails")):
         thumbs = info.get("thumbnails") or []
         images = [t.get("url") for t in thumbs if t.get("url")]
@@ -114,11 +188,9 @@ def extract_media(url: str) -> dict:
                 "title": info.get("title") or "",
             }
 
-    # Pick best video URL (prefer non-watermarked HD)
     video_url = None
     formats = info.get("formats") or []
     if formats:
-        # Sort by resolution descending, prefer mp4
         def _key(f):
             return (
                 f.get("height") or 0,
@@ -145,6 +217,26 @@ def extract_media(url: str) -> dict:
         }
 
     return {"type": "none"}
+
+
+def extract_media(url: str) -> dict:
+    """Extract direct media URLs without downloading.
+
+    Strategy: try the reliable TikWM API first (fast, HD, no-watermark, supports
+    slideshows). If that fails for any reason, fall back to yt-dlp.
+    """
+    try:
+        result = _extract_via_tikwm(url)
+        if result and result.get("type") in ("video", "images"):
+            return result
+    except Exception as e:
+        logger.warning(f"TikWM extractor failed, falling back to yt-dlp: {e}")
+
+    try:
+        return _extract_via_ytdlp(url)
+    except Exception as e:
+        logger.error(f"yt-dlp extractor failed: {e}")
+        raise
 
 
 def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
