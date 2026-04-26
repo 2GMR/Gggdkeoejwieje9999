@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import time
+import tempfile
 import logging
 import requests
 from flask import Flask, request, jsonify
@@ -66,6 +68,19 @@ TIKWM_HEADERS = {
     "Referer": "https://www.tikwm.com/",
 }
 
+WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Maximum video size to upload via Telegram bot API (50 MB hard limit)
+MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+
 WELCOME = (
     "👋 أهلاً بك!\n\n"
     "أرسل لي رابط فيديو أو صور من تيك توك وسأقوم بتحميله لك بأعلى جودة.\n\n"
@@ -111,6 +126,166 @@ def is_tiktok_url(text: str) -> bool:
         "vt.tiktok.com",
         "m.tiktok.com",
     ])
+
+
+def _resolve_canonical_url(url: str) -> str:
+    """Follow short-link redirects (vt.tiktok.com / vm.tiktok.com) to the
+    canonical https://www.tiktok.com/@user/video/<id> URL."""
+    try:
+        r = requests.head(url, headers=WEB_HEADERS, allow_redirects=True, timeout=10)
+        return r.url or url
+    except Exception:
+        return url
+
+
+def _walk_for_video(node, depth: int = 0):
+    """Recursively walk a JSON tree to find the TikTok video node containing
+    bitrateInfo (the list of available qualities)."""
+    if depth > 10:
+        return None
+    if isinstance(node, dict):
+        if (
+            "video" in node
+            and isinstance(node["video"], dict)
+            and ("bitrateInfo" in node["video"] or "playAddr" in node["video"])
+        ):
+            return node
+        for v in node.values():
+            r = _walk_for_video(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(node, list):
+        for item in node:
+            r = _walk_for_video(item, depth + 1)
+            if r:
+                return r
+    return None
+
+
+def _walk_for_images(node, depth: int = 0):
+    """Find a slideshow / image-post node in the rehydration JSON."""
+    if depth > 10:
+        return None
+    if isinstance(node, dict):
+        if "imagePost" in node and isinstance(node["imagePost"], dict):
+            return node["imagePost"]
+        for v in node.values():
+            r = _walk_for_images(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(node, list):
+        for item in node:
+            r = _walk_for_images(item, depth + 1)
+            if r:
+                return r
+    return None
+
+
+def _extract_via_web(url: str) -> dict:
+    """Primary extractor: scrape TikTok's web page directly.
+
+    The page embeds a __UNIVERSAL_DATA_FOR_REHYDRATION__ <script> tag with the
+    full bitrateInfo list (5 qualities including 720p HEVC). This works from
+    cloud IPs that the internal API endpoints block.
+    """
+    canonical = _resolve_canonical_url(url)
+    r = requests.get(canonical, headers=WEB_HEADERS, allow_redirects=True, timeout=15)
+    r.raise_for_status()
+    html = r.text
+
+    m = re.search(
+        r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.+?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if not m:
+        return {"type": "none"}
+
+    try:
+        data = json.loads(m.group(1))
+    except Exception as e:
+        logger.warning(f"web extractor: failed to parse JSON: {e}")
+        return {"type": "none"}
+
+    # Try slideshow first
+    img_post = _walk_for_images(data)
+    if img_post:
+        images = []
+        for img in img_post.get("images", []):
+            url_list = (img.get("imageURL") or {}).get("urlList") or []
+            if url_list:
+                images.append(url_list[0])
+        title = ""
+        # Caption usually lives a level up in itemStruct
+        if images:
+            return {"type": "images", "urls": images, "title": title}
+
+    # Video
+    vnode = _walk_for_video(data)
+    if not vnode:
+        return {"type": "none"}
+
+    v = vnode["video"]
+    title = vnode.get("desc") or ""
+
+    # Pick best quality from bitrateInfo. Prefer the highest resolution
+    # (GearName starting with "adapt_lower_720" or any 720+ height); among
+    # equal heights prefer higher bitrate.
+    bitrate_info = v.get("bitrateInfo") or []
+
+    def _height(b):
+        # GearName usually contains the resolution e.g. "adapt_lower_720_1"
+        gn = (b.get("GearName") or "").lower()
+        m = re.search(r"(\d{3,4})", gn)
+        return int(m.group(1)) if m else 0
+
+    candidates = []
+    for b in bitrate_info:
+        play_addr = b.get("PlayAddr") or {}
+        urls = play_addr.get("UrlList") or []
+        if not urls:
+            continue
+        candidates.append({
+            "height": _height(b),
+            "bitrate": b.get("Bitrate") or 0,
+            "size": int(play_addr.get("DataSize") or 0),
+            "codec": b.get("CodecType") or "",
+            "url": urls[0],
+            "backup_urls": urls,
+        })
+
+    chosen = None
+    if candidates:
+        candidates.sort(key=lambda c: (c["height"], c["bitrate"]), reverse=True)
+        chosen = candidates[0]
+
+    video_url = chosen["url"] if chosen else (v.get("playAddr") or v.get("downloadAddr"))
+    if not video_url:
+        return {"type": "none"}
+
+    # Width/height: bitrateInfo gear gives us actual resolution, video.{width,height}
+    # is only the smallest variant. Compute proper width based on aspect ratio.
+    src_w = int(v.get("width") or 0)
+    src_h = int(v.get("height") or 0)
+    if chosen and chosen["height"] and src_w and src_h:
+        out_h = chosen["height"]
+        out_w = int(round(src_w * out_h / src_h))
+    else:
+        out_h = src_h
+        out_w = src_w
+
+    return {
+        "type": "video",
+        "url": video_url,
+        "backup_urls": chosen["backup_urls"] if chosen else [video_url],
+        "title": title,
+        "duration": int(v.get("duration") or 0),
+        "width": out_w,
+        "height": out_h,
+        "size": chosen["size"] if chosen else 0,
+        "thumbnail": (v.get("cover") or v.get("originCover") or ""),
+        "needs_referer": True,
+    }
 
 
 def _tikwm_call(url: str) -> dict | None:
@@ -304,12 +479,20 @@ def extract_media(url: str) -> dict:
     """Extract direct media URLs without downloading.
 
     Strategy:
-      1) yt-dlp first — gives access to the highest available resolution
-         (usually 720p HEVC for TikTok), with full width/height/duration
-         metadata so Telegram does not re-encode.
-      2) TikWM API as fallback — fast and reliable, handy if yt-dlp fails
-         due to TikTok extractor changes. Returns 540p H.264.
+      1) Web scraper — reads __UNIVERSAL_DATA_FOR_REHYDRATION__ from the
+         tiktok.com page. Gives access to the FULL bitrateInfo list
+         including 720p HEVC (highest quality TikTok serves). Works from
+         cloud IPs.
+      2) yt-dlp — fallback if the web page format changes.
+      3) TikWM API — last-resort fallback (returns 540p H.264 only).
     """
+    try:
+        result = _extract_via_web(url)
+        if result and result.get("type") in ("video", "images"):
+            return result
+    except Exception as e:
+        logger.warning(f"web extractor failed, trying yt-dlp: {e}")
+
     try:
         result = _extract_via_ytdlp(url)
         if result and result.get("type") in ("video", "images"):
@@ -324,7 +507,114 @@ def extract_media(url: str) -> dict:
         raise
 
 
+def download_to_tempfile(media: dict) -> str | None:
+    """Download the video to a local temp file with the proper Referer header.
+    TikTok's CDN requires a tiktok.com referer — Telegram's URL fetcher does
+    not send one, so passing the URL directly to sendVideo often fails or
+    yields the lowest-quality fallback.
+
+    Returns the temp file path, or None on failure.
+    """
+    urls = media.get("backup_urls") or [media.get("url")]
+    headers = {
+        "User-Agent": WEB_HEADERS["User-Agent"],
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+        "Range": "bytes=0-",
+    }
+    for u in urls:
+        if not u:
+            continue
+        try:
+            r = requests.get(u, headers=headers, stream=True, timeout=25)
+            if r.status_code not in (200, 206):
+                logger.warning(f"download status {r.status_code} for {u[:80]}")
+                continue
+            total = int(r.headers.get("Content-Length") or 0)
+            if total and total > MAX_UPLOAD_BYTES:
+                logger.info(f"video too large ({total} bytes), will fall back to URL")
+                return None
+
+            tmp = tempfile.NamedTemporaryFile(prefix="tiktok_", suffix=".mp4", delete=False)
+            written = 0
+            try:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        tmp.close()
+                        os.unlink(tmp.name)
+                        logger.info("video exceeded max size during stream")
+                        return None
+                    tmp.write(chunk)
+                tmp.close()
+                if written < 10_000:
+                    os.unlink(tmp.name)
+                    continue
+                logger.info(f"downloaded {written/1024:.0f} KB to {tmp.name}")
+                return tmp.name
+            except Exception as e:
+                tmp.close()
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+                logger.warning(f"download stream error: {e}")
+                continue
+        except Exception as e:
+            logger.warning(f"download request failed: {e}")
+            continue
+    return None
+
+
+def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int = None):
+    """Upload the local file via multipart — Telegram won't re-fetch the URL,
+    preserving the original quality (especially HEVC 720p)."""
+    data = {
+        "chat_id": str(chat_id),
+        "supports_streaming": "true",
+        "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+    }
+    if media.get("duration"):
+        data["duration"] = str(int(media["duration"]))
+    if media.get("width"):
+        data["width"] = str(int(media["width"]))
+    if media.get("height"):
+        data["height"] = str(int(media["height"]))
+    if reply_to:
+        data["reply_to_message_id"] = str(reply_to)
+
+    files = {"video": ("video.mp4", open(file_path, "rb"), "video/mp4")}
+    if media.get("thumbnail"):
+        try:
+            tr = requests.get(media["thumbnail"], timeout=8)
+            if tr.status_code == 200 and tr.content:
+                files["thumbnail"] = ("thumb.jpg", tr.content, "image/jpeg")
+        except Exception:
+            pass
+
+    try:
+        r = requests.post(
+            f"{TELEGRAM_API}/sendVideo",
+            data=data,
+            files=files,
+            timeout=120,
+        )
+        return r.json()
+    except Exception as e:
+        logger.error(f"sendVideo upload failed: {e}")
+        return None
+    finally:
+        try:
+            files["video"][1].close()
+        except Exception:
+            pass
+
+
 def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
+    """Last-resort: hand the URL to Telegram. Quality may degrade because
+    Telegram fetches without a proper Referer."""
     payload = {
         "chat_id": chat_id,
         "video": media["url"],
@@ -341,7 +631,7 @@ def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
         payload["thumb"] = media["thumbnail"]
     if reply_to:
         payload["reply_to_message_id"] = reply_to
-    return tg("sendVideo", payload, timeout=20)
+    return tg("sendVideo", payload, timeout=30)
 
 
 def send_images_as_group(chat_id: int, images: list, reply_to: int = None):
@@ -407,9 +697,25 @@ def handle_update(update: dict):
         return
 
     if media["type"] == "video":
-        res = send_video_by_url(chat_id, media, reply_to=msg_id)
+        res = None
+        tmp_path = None
+        try:
+            tmp_path = download_to_tempfile(media)
+            if tmp_path:
+                res = send_video_by_file(chat_id, media, tmp_path, reply_to=msg_id)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        # Fallback: try sending the URL directly
         if not res or not res.get("ok"):
-            # Fallback: send as document or plain link
+            logger.warning(f"file upload failed, trying URL: {res}")
+            res = send_video_by_url(chat_id, media, reply_to=msg_id)
+
+        if not res or not res.get("ok"):
             send_message(
                 chat_id,
                 "⚠️ تعذّر إرسال الفيديو مباشرة. هذا هو الرابط المباشر:\n\n" + media["url"],
