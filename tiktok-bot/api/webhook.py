@@ -2,7 +2,9 @@ import os
 import re
 import json
 import time
+import shutil
 import tempfile
+import subprocess
 import logging
 import requests
 from flask import Flask, request, jsonify
@@ -80,6 +82,11 @@ WEB_HEADERS = {
 
 # Maximum video size to upload via Telegram bot API (50 MB hard limit)
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+
+# ffmpeg used to transcode HEVC → H.264 for smooth playback on all Telegram
+# clients. Disabled if ffmpeg is missing (the bot still sends the original).
+FFMPEG_BIN = shutil.which("ffmpeg")
+FFPROBE_BIN = shutil.which("ffprobe")
 
 WELCOME = (
     "👋 أهلاً بك!\n\n"
@@ -507,6 +514,80 @@ def extract_media(url: str) -> dict:
         raise
 
 
+def _probe_video_codec(path: str) -> str | None:
+    """Return the video codec name (e.g. 'h264', 'hevc') or None."""
+    if not FFPROBE_BIN:
+        return None
+    try:
+        r = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=8,
+        )
+        return (r.stdout or "").strip().lower() or None
+    except Exception as e:
+        logger.warning(f"ffprobe failed: {e}")
+        return None
+
+
+def transcode_to_h264(src_path: str) -> str | None:
+    """Transcode a video to H.264 + AAC with constant frame rate and faststart.
+
+    This makes the file play smoothly on every Telegram client (HEVC / H.265
+    causes stuttering on Telegram Desktop and many Android devices).
+    Returns the new file path, or None on failure.
+    """
+    if not FFMPEG_BIN:
+        return None
+
+    dst_fd, dst_path = tempfile.mkstemp(prefix="tiktok_h264_", suffix=".mp4")
+    os.close(dst_fd)
+    try:
+        cmd = [
+            FFMPEG_BIN, "-y", "-loglevel", "error",
+            "-i", src_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-r", "30",                       # constant 30fps fixes stutter
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-movflags", "+faststart",
+            dst_path,
+        ]
+        t0 = time.time()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        elapsed = time.time() - t0
+        if r.returncode != 0:
+            logger.warning(f"ffmpeg transcode failed (exit {r.returncode}): {r.stderr[:200]}")
+            try: os.unlink(dst_path)
+            except Exception: pass
+            return None
+        size = os.path.getsize(dst_path)
+        if size < 10_000:
+            try: os.unlink(dst_path)
+            except Exception: pass
+            return None
+        if size > MAX_UPLOAD_BYTES:
+            logger.info(f"transcoded file too large ({size} bytes)")
+            try: os.unlink(dst_path)
+            except Exception: pass
+            return None
+        logger.info(f"transcoded HEVC→H.264 in {elapsed:.1f}s, {size/1024:.0f} KB")
+        return dst_path
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg transcode timed out")
+        try: os.unlink(dst_path)
+        except Exception: pass
+        return None
+    except Exception as e:
+        logger.warning(f"ffmpeg transcode error: {e}")
+        try: os.unlink(dst_path)
+        except Exception: pass
+        return None
+
+
 def download_to_tempfile(media: dict) -> str | None:
     """Download the video to a local temp file with the proper Referer header.
     TikTok's CDN requires a tiktok.com referer — Telegram's URL fetcher does
@@ -699,16 +780,28 @@ def handle_update(update: dict):
     if media["type"] == "video":
         res = None
         tmp_path = None
+        transcoded_path = None
+        upload_path = None
         try:
             tmp_path = download_to_tempfile(media)
             if tmp_path:
-                res = send_video_by_file(chat_id, media, tmp_path, reply_to=msg_id)
+                upload_path = tmp_path
+                # If the source is HEVC, transcode it to H.264 for smooth
+                # playback on every Telegram client. Telegram's web/desktop
+                # clients in particular stutter on HEVC.
+                codec = _probe_video_codec(tmp_path)
+                if codec in ("hevc", "h265"):
+                    send_chat_action(chat_id, "upload_video")
+                    transcoded_path = transcode_to_h264(tmp_path)
+                    if transcoded_path:
+                        upload_path = transcoded_path
+
+                res = send_video_by_file(chat_id, media, upload_path, reply_to=msg_id)
         finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+            for p in (tmp_path, transcoded_path):
+                if p:
+                    try: os.unlink(p)
+                    except Exception: pass
 
         # Fallback: try sending the URL directly
         if not res or not res.get("ok"):
