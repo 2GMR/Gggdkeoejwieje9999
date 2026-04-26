@@ -1,88 +1,154 @@
-# بوت تليجرام لتحميل تيك توك (Vercel Serverless)
+# TikTok Downloader Bot — @GMR2BOT
 
-بوت تليجرام لتحميل فيديوهات وصور تيك توك بأعلى جودة وبدون علامة مائية، مصمّم للعمل على منصة Vercel كدوال سحابية (Serverless Functions).
+بوت تيليجرام لتحميل فيديوهات وصور تيك توك بدون علامة مائية.
 
-## المميزات
+---
 
-- ⚡ **سرعة فائقة**: لا يتم تحميل الفيديو على الخادم. يُمرَّر الرابط المباشر مباشرةً إلى تليجرام (`sendVideo` بـ URL) فيقوم تليجرام بسحبه من تيك توك.
-- 💰 **استهلاك Bandwidth صفر** على Vercel.
-- 🖼️ **دعم الصور**: يرسل البوستات المصورة (Slideshow) كـ Media Group.
-- 🎬 **أعلى جودة**: يختار أعلى دقة متاحة (HD) تلقائياً.
-- 🔒 **أمان**: يدعم `secret_token` للتحقق من أن الطلبات تأتي من تليجرام فعلاً.
-- 🚀 **مقاوم للانهيار**: يرد على Telegram بسرعة (200 OK) حتى عند الأخطاء، فلا يحدث retry/queue.
+## ✨ المميزات
 
-## الملفات
+- ✅ يدعم فيديوهات تيك توك (بدون علامة مائية)
+- ✅ يدعم Slideshows (الصور المتعددة)
+- ✅ يعمل بطريقتين: **خفيفة (Vercel)** أو **كاملة (خادم خاص)**
+- ✅ يدعم الروابط القصيرة (`vt.tiktok.com`, `vm.tiktok.com`)
 
+---
+
+## 🎯 وضعا التشغيل
+
+| الخاصية | وضع Vercel (Serverless) | وضع الخادم الكامل |
+|---------|------------------------|--------------------|
+| الجودة | 540p H.264 | **720p HEVC → H.264** |
+| تصحيح التقطيع | ❌ | ✅ ffmpeg transcode |
+| الاستهلاك | URL relay فقط (لا تحميل) | تحميل + تحويل + رفع |
+| المنصات | Vercel / Netlify / Lambda | Replit / Oracle / VPS / Render |
+| المتطلبات | بدون ffmpeg | يحتاج ffmpeg |
+
+البوت يكتشف البيئة تلقائياً من متغيرات النظام.
+
+---
+
+## 🚀 النشر على Vercel (مجاني، بدون بطاقة)
+
+### الخطوات
+
+1. **أنشئ حساباً على Vercel**: https://vercel.com (سجّل بـ GitHub - لا يطلب بطاقة)
+
+2. **ارفع المشروع على GitHub**:
+   ```bash
+   cd tiktok-bot
+   git init
+   git add .
+   git commit -m "Initial commit"
+   gh repo create tiktok-bot --public --source=. --push
+   ```
+
+3. **أنشئ مشروع جديد على Vercel**:
+   - Add New → Project
+   - استورد الريبو من GitHub
+   - في Settings → Environment Variables أضف:
+     - `BOT_TOKEN` = توكن البوت من BotFather
+   - اضغط Deploy
+
+4. **سجّل الـ Webhook عند تليجرام** (مرة واحدة فقط):
+   ```
+   افتح في المتصفح:
+   https://YOUR-PROJECT.vercel.app/api/setwebhook
+   ```
+   سترى `{"ok": true}` يعني نجح التسجيل.
+
+5. **جرّب البوت** على تليجرام: أرسل أي رابط تيك توك.
+
+### حدود Vercel المجاني (Hobby)
+
+- ✅ **100,000 طلب/شهر** (~3,300 فيديو/يوم)
+- ✅ **100 GB bandwidth** (شبه لا تستهلكه - الفيديو يمر عبر تليجرام مباشرة)
+- ✅ يعمل 24/7 بدون نوم
+- ⚠️ Function timeout: 10 ثوان (الكود مُحسَّن لاحترامها)
+
+---
+
+## 🖥️ النشر على خادم كامل (لجودة 720p سلسة)
+
+ليتفعّل وضع 720p HEVC + التحويل إلى H.264، يجب أن تكون البيئة:
+- تدعم Python 3.11+
+- تدعم تشغيل **ffmpeg**
+- بدون timeout صارم
+
+### المنصات الموصى بها (مجانية بدون بطاقة محدودة):
+
+| المنصة | السعر | Bandwidth | بطاقة؟ |
+|--------|-------|-----------|--------|
+| **Replit Reserved VM** | $7/شهر | حسب الخطة | لا للبدء |
+| **Oracle Cloud Free** | مجاني للأبد | 10 TB/شهر | ⚠️ نعم للتحقق |
+| **Contabo VPS** | $5/شهر | 32 TB/شهر | نعم |
+
+### الخطوات على VPS عام (Ubuntu)
+
+```bash
+# 1. ثبت Python و ffmpeg
+sudo apt update && sudo apt install -y python3 python3-pip ffmpeg git
+
+# 2. استنسخ المشروع
+git clone <repo-url> && cd tiktok-bot
+pip install -r requirements.txt
+
+# 3. شغّل البوت بنمط polling (لا يحتاج webhook ولا دومين)
+export BOT_TOKEN="..."
+python local_polling.py
 ```
-tiktok-bot/
-├── api/
-│   └── webhook.py        # دالة Vercel Serverless (Flask)
-├── vercel.json           # إعدادات النشر والتوجيه
-├── requirements.txt      # المكتبات المطلوبة
-└── README.md
+
+أو استخدم systemd لتشغيله 24/7:
+
+```ini
+# /etc/systemd/system/tiktok-bot.service
+[Unit]
+Description=TikTok Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tiktok-bot
+Environment="BOT_TOKEN=YOUR_TOKEN"
+ExecStart=/usr/bin/python3 local_polling.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-## خطوات النشر
+```bash
+sudo systemctl enable --now tiktok-bot
+```
 
-### 1) إنشاء بوت تليجرام
+---
 
-- ادخل على [@BotFather](https://t.me/BotFather) في تليجرام.
-- أرسل `/newbot` واتبع التعليمات.
-- احفظ **BOT_TOKEN** الذي ستحصل عليه.
-
-### 2) رفع المشروع إلى Vercel
-
-ارفع مجلد `tiktok-bot/` كمشروع مستقل على GitHub، ثم اربطه بـ Vercel، أو استخدم CLI:
+## 🔧 التشغيل المحلي (للاختبار على Replit)
 
 ```bash
 cd tiktok-bot
-npx vercel --prod
+python local_polling.py
 ```
 
-### 3) ضبط متغيرات البيئة في Vercel
+البوت يستخدم polling (لا يحتاج webhook) — مثالي للاختبار.
 
-من لوحة تحكم Vercel → Project → Settings → Environment Variables، أضف:
+---
 
-| المتغيّر | القيمة | إلزامي؟ |
-|---|---|---|
-| `BOT_TOKEN` | توكن البوت من BotFather | ✅ |
-| `WEBHOOK_URL` | رابط مشروعك على Vercel، مثل `https://your-bot.vercel.app` | ✅ |
-| `WEBHOOK_SECRET` | أي نص عشوائي قوي للتحقق من Telegram | اختياري لكن موصى به |
-| `BOT_USERNAME` | اسم البوت بدون @ (يظهر في التعليق) | اختياري |
+## 📦 الملفات
 
-ثم أعد النشر (Redeploy) لتطبيق المتغيّرات.
+- `api/webhook.py` — الكود الرئيسي (Flask + extract + send)
+- `local_polling.py` — مشغّل polling للاختبار المحلي
+- `vercel.json` — تكوين النشر على Vercel
+- `requirements.txt` — حزم Python
 
-### 4) تسجيل Webhook لدى تليجرام
+---
 
-افتح في المتصفح:
+## 🔑 متغيرات البيئة
 
-```
-https://your-bot.vercel.app/api/setwebhook
-```
-
-ستظهر استجابة `{"ok": true, "result": true, ...}` تؤكد التسجيل.
-
-### 5) جرّب البوت
-
-افتح بوتك على تليجرام، أرسل `/start`، ثم أرسل أي رابط من تيك توك.
-
-## معمارية البوت (لماذا لا ينهار؟)
-
-1. **Webhooks بدلاً من Polling** → مناسب 100% لـ Serverless.
-2. **Zero-Bandwidth Strategy**: نمرّر الرابط المباشر للفيديو إلى تليجرام، فلا تمر البيانات عبر Vercel أبداً.
-3. **Quick 200 OK**: نرد على Telegram خلال أجزاء من الثانية، حتى لو حدث خطأ داخلي، فلا يقوم Telegram بإعادة الإرسال أو تكديس التحديثات.
-4. **Stateless**: كل طلب مستقل، يتوسّع تلقائياً مع آلاف المستخدمين المتزامنين.
-5. **معالجة الأخطاء**: عند فشل الإرسال المباشر، يُرسل البوت الرابط المباشر للمستخدم كحل بديل.
-6. **Memory & Timeout مرفوعان** في `vercel.json` (1GB / 30s) لاستيعاب طلبات yt-dlp.
-
-## الأوامر المدعومة
-
-- `/start` — رسالة الترحيب
-- `/help` — شرح الاستخدام
-- أي رابط من `tiktok.com` / `vm.tiktok.com` / `vt.tiktok.com`
-
-## ملاحظات لرفع السعة
-
-- إذا توقّع مئات الآلاف من المستخدمين يومياً، فعّل **Pro Plan** على Vercel (للحصول على concurrency أعلى).
-- حدّث `yt-dlp` دورياً (Vercel يعيد تثبيت الـ requirements مع كل deployment) لمواكبة تغييرات تيك توك.
-- لتعطيل التحقق من Telegram لأغراض التطوير، احذف `WEBHOOK_SECRET` فقط.
+| المتغير | إجباري | الوصف |
+|---------|--------|-------|
+| `BOT_TOKEN` | ✅ | توكن البوت من @BotFather |
+| `WEBHOOK_URL` | فقط للنشر | رابط Vercel/الخادم (للـ setwebhook) |
+| `WEBHOOK_SECRET` | اختياري | كلمة سر إضافية للأمان |
+| `BOT_USERNAME` | اختياري | يُضاف في توقيع الفيديو |
+| `SERVERLESS_MODE` | اختياري | `1` لإجبار وضع Vercel |
