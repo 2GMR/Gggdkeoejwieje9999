@@ -6,8 +6,12 @@ import shutil
 import tempfile
 import subprocess
 import logging
+import base64
+import hmac
+import hashlib
+import threading
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from yt_dlp import YoutubeDL
 
 logging.basicConfig(level=logging.INFO)
@@ -112,6 +116,91 @@ HELP = (
     "3️⃣ سأقوم بإرساله لك مباشرة بأعلى جودة\n\n"
     "🚀 لا توجد علامة مائية، وتحميل سريع جداً."
 )
+
+
+# ---------------------------------------------------------------------------
+# Telegram file_id cache
+# ---------------------------------------------------------------------------
+# Once Telegram has fetched a video, it stores it on its CDN and gives us a
+# `file_id`. Future requests for the same TikTok video can be served by
+# sending that file_id back — Telegram delivers the cached file directly,
+# zero bytes through our server. This is the single biggest bandwidth win
+# for viral content (e.g. trending videos requested by hundreds of users).
+_FILE_ID_CACHE: dict[str, str] = {}
+_FILE_ID_CACHE_LOCK = threading.Lock()
+_FILE_ID_CACHE_PATH = os.getenv("FILE_ID_CACHE_PATH", "/tmp/tiktok_file_id_cache.json")
+_FILE_ID_CACHE_MAX = int(os.getenv("FILE_ID_CACHE_MAX", "20000"))
+
+
+def _load_file_id_cache():
+    global _FILE_ID_CACHE
+    try:
+        with open(_FILE_ID_CACHE_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _FILE_ID_CACHE = data
+            logger.info(f"file_id cache: loaded {len(_FILE_ID_CACHE)} entries")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"file_id cache: load failed: {e}")
+
+
+def _save_file_id_cache():
+    try:
+        with _FILE_ID_CACHE_LOCK:
+            snapshot = dict(_FILE_ID_CACHE)
+        tmp_path = _FILE_ID_CACHE_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_path, _FILE_ID_CACHE_PATH)
+    except Exception as e:
+        logger.warning(f"file_id cache: save failed: {e}")
+
+
+def _extract_video_id(url: str) -> str | None:
+    """Return the canonical TikTok video ID (e.g. '7234567890123456789')."""
+    m = re.search(r"/video/(\d+)", url)
+    if m:
+        return m.group(1)
+    if any(d in url.lower() for d in ("vm.tiktok.com", "vt.tiktok.com")):
+        try:
+            canonical = _resolve_canonical_url(url)
+            m = re.search(r"/video/(\d+)", canonical or "")
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return None
+
+
+def _cache_get(video_id: str) -> str | None:
+    if not video_id:
+        return None
+    with _FILE_ID_CACHE_LOCK:
+        return _FILE_ID_CACHE.get(video_id)
+
+
+def _cache_set(video_id: str, file_id: str):
+    if not video_id or not file_id:
+        return
+    with _FILE_ID_CACHE_LOCK:
+        if len(_FILE_ID_CACHE) >= _FILE_ID_CACHE_MAX:
+            try:
+                first = next(iter(_FILE_ID_CACHE))
+                _FILE_ID_CACHE.pop(first, None)
+            except StopIteration:
+                pass
+        _FILE_ID_CACHE[video_id] = file_id
+    _save_file_id_cache()
+
+
+def _cache_drop(video_id: str):
+    if not video_id:
+        return
+    with _FILE_ID_CACHE_LOCK:
+        _FILE_ID_CACHE.pop(video_id, None)
+    _save_file_id_cache()
 
 
 def tg(method: str, payload: dict, timeout: int = 10):
@@ -338,18 +427,11 @@ def _tikwm_call(url: str) -> dict | None:
             play_url = d.get("play")
             hd_url = d.get("hdplay")
             wm_url = d.get("wmplay")
-            play_size = d.get("size") or 0
-            hd_size = d.get("hd_size") or 0
 
-            video_url = None
-            if hd_url and hd_size and play_size and hd_size > play_size * 1.15:
-                video_url = hd_url
-            elif play_url:
-                video_url = play_url
-            elif hd_url:
-                video_url = hd_url
-            elif wm_url:
-                video_url = wm_url
+            # Always prefer hdplay when present — it returns 720p H.264 with
+            # no watermark, and the URL works without a Referer header so
+            # Telegram can fetch it directly (zero bandwidth on our server).
+            video_url = hd_url or play_url or wm_url
 
             if video_url:
                 return {
@@ -507,16 +589,23 @@ def extract_media(url: str) -> dict:
       3) TikWM API — last-resort fallback (540p H.264 only).
     """
     if SERVERLESS_MODE:
+        # 1) TikWM HD endpoint (`hdplay` URL) → 720p H.264, no Referer needed,
+        #    Telegram fetches it directly = ZERO bandwidth on our server.
+        #    This is the path we want for ~95% of requests.
         try:
-            return _extract_via_tikwm(url)
+            result = _extract_via_tikwm(url)
+            if result and result.get("type") in ("video", "images"):
+                return result
         except Exception as e:
-            logger.warning(f"TikWM failed in serverless mode: {e}")
-            # fall through to web scraper as a last attempt
-            try:
-                return _extract_via_web(url)
-            except Exception as e2:
-                logger.error(f"web extractor also failed: {e2}")
-                raise
+            logger.warning(f"TikWM failed, trying web extractor: {e}")
+        # 2) Web extractor → 720p HEVC native, but URL is Referer-locked so
+        #    we'll have to proxy it through Render (consumes bandwidth).
+        #    Only used when TikWM is unreachable or rate-limited.
+        try:
+            return _extract_via_web(url)
+        except Exception as e:
+            logger.error(f"web extractor also failed: {e}")
+            raise
 
     try:
         result = _extract_via_web(url)
@@ -680,7 +769,7 @@ def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int 
     data = {
         "chat_id": str(chat_id),
         "supports_streaming": "true",
-        "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+        "caption": "Tik : 1l.u",
     }
     if media.get("duration"):
         data["duration"] = str(int(media["duration"]))
@@ -718,6 +807,47 @@ def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int 
             pass
 
 
+PROXY_SECRET = (
+    os.getenv("WEBHOOK_SECRET")
+    or os.getenv("SESSION_SECRET")
+    or (BOT_TOKEN or "fallback-secret")
+).encode()
+
+
+def _sign_proxy_url(src_url: str) -> str:
+    """Build a tamper-proof proxy URL pointing at /api/v/<token>.
+
+    The token contains the source URL plus an HMAC signature so nobody can
+    reuse our server to proxy arbitrary URLs.
+    """
+    raw = src_url.encode()
+    b64 = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    sig = hmac.new(PROXY_SECRET, raw, hashlib.sha256).hexdigest()[:16]
+    return f"{b64}.{sig}"
+
+
+def _verify_proxy_token(token: str) -> str | None:
+    try:
+        b64, sig = token.split(".", 1)
+        pad = "=" * (-len(b64) % 4)
+        raw = base64.urlsafe_b64decode(b64 + pad)
+        expected = hmac.new(PROXY_SECRET, raw, hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return raw.decode()
+    except Exception:
+        return None
+
+
+def _build_proxy_url(src_url: str) -> str | None:
+    """Return a public Render URL that proxies the TikTok CDN with Referer.
+    Returns None if WEBHOOK_URL is not configured (proxy unavailable)."""
+    base = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/api/v/{_sign_proxy_url(src_url)}"
+
+
 def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
     """Last-resort: hand the URL to Telegram. Quality may degrade because
     Telegram fetches without a proper Referer."""
@@ -725,7 +855,7 @@ def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
         "chat_id": chat_id,
         "video": media["url"],
         "supports_streaming": True,
-        "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+        "caption": "Tik : 1l.u",
     }
     if media.get("duration"):
         payload["duration"] = int(media["duration"])
@@ -749,13 +879,80 @@ def send_images_as_group(chat_id: int, images: list, reply_to: int = None):
         for idx, img in enumerate(chunk):
             item = {"type": "photo", "media": img}
             if i == 0 and idx == 0:
-                item["caption"] = "✅ تم التحميل"
+                item["caption"] = "Tik : 1l.u"
             media.append(item)
         payload = {"chat_id": chat_id, "media": media}
         if reply_to and i == 0:
             payload["reply_to_message_id"] = reply_to
         results.append(tg("sendMediaGroup", payload, timeout=20))
     return results
+
+
+class ProgressIndicator:
+    """Sends a placeholder message and animates a progress bar while the
+    actual download/upload runs in the foreground. The message is deleted
+    when stop_and_delete() is called, just before the video appears."""
+
+    def __init__(self, chat_id: int, reply_to: int = None):
+        self.chat_id = chat_id
+        self.reply_to = reply_to
+        self.msg_id = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def _render(pct: int) -> str:
+        bars = 10
+        filled = max(0, min(bars, round(pct / 100 * bars)))
+        bar = "▰" * filled + "▱" * (bars - filled)
+        return f"⏳ جاري التحميل\n{bar}  {pct}%"
+
+    def start(self):
+        payload = {
+            "chat_id": self.chat_id,
+            "text": self._render(15),
+            "disable_web_page_preview": True,
+        }
+        if self.reply_to:
+            payload["reply_to_message_id"] = self.reply_to
+        res = tg("sendMessage", payload, timeout=5)
+        self.msg_id = ((res or {}).get("result") or {}).get("message_id")
+        if self.msg_id:
+            self._thread = threading.Thread(target=self._tick, daemon=True)
+            self._thread.start()
+
+    def _tick(self):
+        # Animate fake progress while extraction/upload is in flight.
+        # Telegram rate-limits editMessage to ~1/sec per chat — we stay well
+        # under that.
+        for pct in (35, 60, 85):
+            if self._stop.wait(1.4):
+                return
+            try:
+                tg("editMessageText", {
+                    "chat_id": self.chat_id,
+                    "message_id": self.msg_id,
+                    "text": self._render(pct),
+                }, timeout=5)
+            except Exception:
+                return
+
+    def stop_and_delete(self):
+        self._stop.set()
+        if self._thread:
+            try:
+                self._thread.join(timeout=0.5)
+            except Exception:
+                pass
+        if self.msg_id:
+            try:
+                tg("deleteMessage", {
+                    "chat_id": self.chat_id,
+                    "message_id": self.msg_id,
+                }, timeout=5)
+            except Exception:
+                pass
+            self.msg_id = None
 
 
 def handle_update(update: dict):
@@ -791,9 +988,34 @@ def handle_update(update: dict):
 
     send_chat_action(chat_id, "upload_video")
 
+    # ---- Telegram file_id cache hit: serve instantly with zero bandwidth ----
+    video_id = _extract_video_id(url)
+    if video_id:
+        cached = _cache_get(video_id)
+        if cached:
+            logger.info(f"cache HIT video_id={video_id} → sending by file_id")
+            payload = {
+                "chat_id": chat_id,
+                "video": cached,
+                "supports_streaming": True,
+                "caption": "Tik : 1l.u",
+            }
+            if msg_id:
+                payload["reply_to_message_id"] = msg_id
+            res = tg("sendVideo", payload, timeout=15)
+            if res and res.get("ok"):
+                return
+            # Cached file_id may have expired or been deleted by Telegram.
+            logger.warning(f"file_id send failed, dropping cache for {video_id}: {res}")
+            _cache_drop(video_id)
+
+    progress = ProgressIndicator(chat_id, reply_to=msg_id)
+    progress.start()
+
     try:
         media = extract_media(url)
     except Exception as e:
+        progress.stop_and_delete()
         logger.exception("extract_media failed")
         send_message(
             chat_id,
@@ -802,14 +1024,29 @@ def handle_update(update: dict):
         )
         return
 
+    try:
+        _dispatch_media(chat_id, msg_id, url, media, video_id, progress)
+    finally:
+        progress.stop_and_delete()
+
+
+def _dispatch_media(chat_id, msg_id, url, media, video_id, progress):
     if media["type"] == "video":
         res = None
 
         if SERVERLESS_MODE:
-            # Lightweight URL-relay mode (Vercel / Netlify / Lambda).
-            # Telegram fetches the video itself — we never touch the bytes.
-            # Quality is 540p H.264 (TikWM's `play` URL works without Referer).
-            res = send_video_by_url(chat_id, media, reply_to=msg_id)
+            # Lightweight URL-relay mode. Telegram fetches the video itself.
+            # If the source URL needs a Referer header (web extractor → 720p
+            # HEVC native quality), wrap it in our /api/v/<token> proxy so
+            # Telegram fetches through us with the proper header. The proxy
+            # streams bytes without touching CPU/RAM.
+            relay_media = media
+            if media.get("needs_referer"):
+                proxied = _build_proxy_url(media["url"])
+                if proxied:
+                    relay_media = dict(media)
+                    relay_media["url"] = proxied
+            res = send_video_by_url(chat_id, relay_media, reply_to=msg_id)
         else:
             # Full mode: download → optional HEVC→H.264 transcode → upload.
             tmp_path = None
@@ -844,6 +1081,16 @@ def handle_update(update: dict):
                 "⚠️ تعذّر إرسال الفيديو مباشرة. هذا هو الرابط المباشر:\n\n" + media["url"],
                 reply_to=msg_id,
             )
+        else:
+            # Capture Telegram's file_id so future requests for the same
+            # video are served from Telegram's CDN with zero bandwidth.
+            try:
+                file_id = (res.get("result") or {}).get("video", {}).get("file_id")
+                if file_id and video_id:
+                    _cache_set(video_id, file_id)
+                    logger.info(f"cached file_id for {video_id}")
+            except Exception:
+                pass
     elif media["type"] == "images":
         send_chat_action(chat_id, "upload_photo")
         send_images_as_group(chat_id, media["urls"], reply_to=msg_id)
@@ -908,6 +1155,70 @@ def set_webhook():
     return jsonify(res or {"ok": False}), 200
 
 
+@app.route("/api/v/<token>", methods=["GET", "HEAD"])
+def proxy_video(token):
+    """Stream a TikTok CDN video through Render with the proper Referer.
+
+    Telegram's URL fetcher does not send a Referer header, so TikTok's CDN
+    blocks it (or returns the lowest quality). We sit in the middle: we
+    forward Telegram's request to TikTok adding the required header, and
+    stream the bytes back. CPU cost is minimal (just copying bytes), but
+    bandwidth is consumed once per fetched video.
+    """
+    src = _verify_proxy_token(token)
+    if not src:
+        return jsonify({"ok": False, "error": "invalid token"}), 403
+
+    headers = {
+        "User-Agent": WEB_HEADERS["User-Agent"],
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+    }
+    rng = request.headers.get("Range")
+    if rng:
+        headers["Range"] = rng
+
+    try:
+        upstream = requests.get(src, headers=headers, stream=True, timeout=20)
+    except Exception as e:
+        logger.warning(f"proxy upstream error: {e}")
+        return jsonify({"ok": False, "error": "upstream"}), 502
+
+    if upstream.status_code not in (200, 206):
+        upstream.close()
+        return jsonify({"ok": False, "error": f"upstream {upstream.status_code}"}), 502
+
+    response_headers = {
+        "Content-Type": upstream.headers.get("Content-Type", "video/mp4"),
+        "Cache-Control": "public, max-age=3600",
+    }
+    for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
+        if h in upstream.headers:
+            response_headers[h] = upstream.headers[h]
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=upstream.status_code,
+        headers=response_headers,
+    )
+
+
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "ok", "service": "tiktok-bot"}), 200
+    return jsonify({
+        "status": "ok",
+        "service": "tiktok-bot",
+        "cached_videos": len(_FILE_ID_CACHE),
+    }), 200
+
+
+# Initialise the file_id cache on import (after the file path is known).
+_load_file_id_cache()
