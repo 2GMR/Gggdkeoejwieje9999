@@ -37,10 +37,39 @@ logger = logging.getLogger("bot-app")
 
 BOT_MODE = os.getenv("BOT_MODE", "webhook").strip().lower()
 
+# Self-ping interval (seconds). Render free tier sleeps after 15 min of
+# inactivity, so we ping every 10 min to stay awake forever.
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "600"))
+KEEPALIVE_ENABLED = os.getenv("KEEPALIVE", "1").strip().lower() not in ("0", "false", "no", "off")
+
 
 @app.route("/health")
 def health():
     return jsonify(ok=True, mode=BOT_MODE)
+
+
+def _keepalive_loop():
+    """Background self-ping to prevent the free-tier instance from sleeping.
+
+    Hits our own /health endpoint every KEEPALIVE_INTERVAL seconds. Any
+    inbound HTTP request resets Render's idle timer, so the service stays
+    awake indefinitely even with zero user traffic.
+    """
+    base = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
+    if not base:
+        logger.warning("KEEPALIVE: WEBHOOK_URL not set — self-ping disabled.")
+        return
+    target = base + "/health"
+    logger.info(f"KEEPALIVE: pinging {target} every {KEEPALIVE_INTERVAL}s")
+    # Initial delay so the server is fully bound before the first ping.
+    time.sleep(30)
+    while True:
+        try:
+            r = requests.get(target, timeout=20)
+            logger.info(f"KEEPALIVE: ping ok ({r.status_code})")
+        except Exception as exc:
+            logger.warning(f"KEEPALIVE: ping failed: {exc}")
+        time.sleep(KEEPALIVE_INTERVAL)
 
 
 def _get_me():
@@ -151,6 +180,10 @@ else:
         "Starting in WEBHOOK mode. After deploy, visit /api/setwebhook "
         "with WEBHOOK_URL set to your public HTTPS URL to register."
     )
+    if KEEPALIVE_ENABLED:
+        threading.Thread(target=_keepalive_loop, name="keepalive", daemon=True).start()
+    else:
+        logger.info("KEEPALIVE: disabled via env var.")
 
 
 if __name__ == "__main__":
