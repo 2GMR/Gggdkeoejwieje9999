@@ -1,14 +1,20 @@
-"""Hugging Face Spaces entry point.
+"""Universal entry point for the TikTok bot.
 
-Runs two things in parallel:
-  1) A tiny Flask server on $PORT (default 7860) so HF Spaces sees the
-     container as "alive" and the Space build succeeds.
-  2) A background thread that long-polls Telegram for updates and
-     dispatches them to the existing handler in api/webhook.py.
+Modes (selected via the BOT_MODE env var):
 
-This avoids needing a public webhook, keep-alive pings, or any external
-service. As long as polling is running, HF Spaces won't put the Space
-to sleep — the container is constantly busy.
+  * BOT_MODE=webhook (default)
+      Runs the Flask app only. Telegram pushes updates to /api/webhook.
+      Use this on Render, Railway, Fly, or any platform that gives you a
+      public HTTPS URL. After deploy, visit /api/setwebhook once to
+      register the webhook with Telegram.
+
+  * BOT_MODE=polling
+      Runs the Flask app AND a background thread that long-polls Telegram
+      for updates. Use this on Replit, local dev, or any environment that
+      cannot expose a public webhook URL.
+
+Either way the same Flask app from api/webhook.py is used, so the routes
+(/, /api/webhook, /api/setwebhook) work in both modes.
 """
 import logging
 import os
@@ -17,38 +23,27 @@ import threading
 import time
 
 import requests
-from flask import Flask, jsonify
+from flask import jsonify
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from api.webhook import handle_update, BOT_TOKEN, TELEGRAM_API  # noqa: E402
+from api.webhook import app, handle_update, BOT_TOKEN, TELEGRAM_API  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("hf-app")
+logger = logging.getLogger("bot-app")
 
-app = Flask(__name__)
-
-
-@app.route("/")
-def root():
-    return jsonify(
-        ok=True,
-        bot="TikTok Downloader",
-        mode="polling",
-        message="Bot is running. Send a TikTok link on Telegram.",
-    )
+BOT_MODE = os.getenv("BOT_MODE", "webhook").strip().lower()
 
 
 @app.route("/health")
 def health():
-    return jsonify(ok=True)
+    return jsonify(ok=True, mode=BOT_MODE)
 
 
 def _get_me():
-    """Identify which bot this token actually belongs to."""
     for attempt in range(3):
         try:
             r = requests.get(f"{TELEGRAM_API}/getMe", timeout=15)
@@ -69,7 +64,6 @@ def _get_me():
 
 
 def _delete_webhook():
-    """Polling and webhooks are mutually exclusive — clear any old webhook."""
     for attempt in range(3):
         try:
             r = requests.post(
@@ -92,7 +86,7 @@ def _polling_loop():
 
     me = _get_me()
     if not me:
-        logger.error("Cannot identify bot. Check BOT_TOKEN secret.")
+        logger.error("Cannot identify bot. Check BOT_TOKEN and outbound network access.")
         return
 
     _delete_webhook()
@@ -109,19 +103,16 @@ def _polling_loop():
             )
             data = r.json()
             if not data.get("ok"):
-                # 401 = bad token, no point retrying.
                 if data.get("error_code") == 401:
                     logger.error(
-                        "BOT_TOKEN is invalid (401). "
-                        "Update the secret in Space Settings and restart."
+                        "BOT_TOKEN is invalid (401). Update the secret and restart."
                     )
                     while True:
                         time.sleep(3600)
-                # 409 = another instance is polling the same token.
                 if data.get("error_code") == 409:
                     logger.error(
                         "Conflict (409): another bot instance is polling. "
-                        "Stop the other instance (e.g. on Replit) and wait."
+                        "Stop the other instance and wait."
                     )
                 logger.warning(f"getUpdates returned: {data}")
                 time.sleep(backoff)
@@ -152,12 +143,14 @@ def _polling_loop():
             backoff = min(backoff * 2, 60)
 
 
-def _start_polling_thread():
-    t = threading.Thread(target=_polling_loop, name="tg-polling", daemon=True)
-    t.start()
-
-
-_start_polling_thread()
+if BOT_MODE == "polling":
+    logger.info("Starting in POLLING mode (background thread).")
+    threading.Thread(target=_polling_loop, name="tg-polling", daemon=True).start()
+else:
+    logger.info(
+        "Starting in WEBHOOK mode. After deploy, visit /api/setwebhook "
+        "with WEBHOOK_URL set to your public HTTPS URL to register."
+    )
 
 
 if __name__ == "__main__":
