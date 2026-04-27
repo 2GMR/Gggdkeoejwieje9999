@@ -1,0 +1,15 @@
+===== Application Startup at 2026-04-27 04:25:14 =====
+
+ * Serving Flask app 'app'
+ * Debug mode: off
+INFO:werkzeug:WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:7860
+ * Running on http://10.112.7.166:7860
+INFO:werkzeug:Press CTRL+C to quit
+INFO:werkzeug:10.16.1.233 - - [27/Apr/2026 04:25:27] "GET /?logs=container&__sign=eyJhbGciOiJFZERTQSJ9.eyJyZWFkIjp0cnVlLCJwZXJtaXNzaW9ucyI6eyJyZXBvLmNvbnRlbnQucmVhZCI6dHJ1ZX0sIm9uQmVoYWxmT2YiOnsia2luZCI6InVzZXIiLCJfaWQiOiI2OWUzMGRlNWRlNjMwZDE4ZjFmMzM4MzIiLCJ1c2VyIjoiU1hYWFhCIiwic2Vzc2lvbklkIjoiNjllMzJhMDlhZmZhYjFlZWNiNjcyYTY3In0sImlhdCI6MTc3NzI2MzkyNSwic3ViIjoiL3NwYWNlcy9TWFhYWEIvTiIsImV4cCI6MTc3NzM1MDMyNSwiaXNzIjoiaHR0cHM6Ly9odWdnaW5nZmFjZS5jbyJ9.Wa-CGOUhT5LcGLAFVr5O6pWoRgFqdVbNHFgnX577SUgVRb3Czhi87R6bzs_Jj5LX6I5myDYtdWva-0vBoSduCg HTTP/1.1" 200 -
+WARNING:hf-app:deleteWebhook failed: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=10)
+INFO:hf-app:Telegram long-polling started.
+INFO:werkzeug:10.16.1.233 - - [27/Apr/2026 04:27:07] "GET /?__sign=eyJhbGciOiJFZERTQSJ9.eyJyZWFkIjp0cnVlLCJwZXJtaXNzaW9ucyI6eyJyZXBvLmNvbnRlbnQucmVhZCI6dHJ1ZX0sIm9uQmVoYWxmT2YiOnsia2luZCI6InVzZXIiLCJfaWQiOiI2OWUzMGRlNWRlNjMwZDE4ZjFmMzM4MzIiLCJ1c2VyIjoiU1hYWFhCIiwic2Vzc2lvbklkIjoiNjllMzJhMDlhZmZhYjFlZWNiNjcyYTY3In0sImlhdCI6MTc3NzI2NDAyNiwic3ViIjoiL3NwYWNlcy9TWFhYWEIvTiIsImV4cCI6MTc3NzM1MDQyNiwiaXNzIjoiaHR0cHM6Ly9odWdnaW5nZmFjZS5jbyJ9.Ld3g7aacJBT3sWWNLq8OY1avcmFUfldGSpzePs9F0xw1MD6idl4xe68t94AtrDIYEFCg_IgE0dFxJDZrgFrJAA HTTP/1.1" 200 -
+INFO:werkzeug:10.16.47.45 - - [27/Apr/2026 04:30:35] "GET /?__sign=eyJhbGciOiJFZERTQSJ9.eyJyZWFkIjp0cnVlLCJwZXJtaXNzaW9ucyI6eyJyZXBvLmNvbnRlbnQucmVhZCI6dHJ1ZX0sIm9uQmVoYWxmT2YiOnsia2luZCI6InVzZXIiLCJfaWQiOiI2OWUzMGRlNWRlNjMwZDE4ZjFmMzM4MzIiLCJ1c2VyIjoiU1hYWFhCIiwic2Vzc2lvbklkIjoiNjllMzJhMDlhZmZhYjFlZWNiNjcyYTY3In0sImlhdCI6MTc3NzI2NDIzMywic3ViIjoiL3NwYWNlcy9TWFhYWEIvTiIsImV4cCI6MTc3NzM1MDYzMywiaXNzIjoiaHR0cHM6Ly9odWdnaW5nZmFjZS5jbyJ9.dGPFiQahMu7YfS6zVxmX9Vgof8A1xTtpM1VqgedF0dMCVfncJRYXm431U147-VvFD_IFd7RAsooExVmZ7uC9Bw HTTP/1.1" 200 -
+INFO:werkzeug:10.16.27.106 - - [27/Apr/2026 04:31:00] "GET /?__sign=eyJhbGciOiJFZERTQSJ9.eyJyZWFkIjp0cnVlLCJwZXJtaXNzaW9ucyI6eyJyZXBvLmNvbnRlbnQucmVhZCI6dHJ1ZX0sIm9uQmVoYWxmT2YiOnsia2luZCI6InVzZXIiLCJfaWQiOiI2OWUzMGRlNWRlNjMwZDE4ZjFmMzM4MzIiLCJ1c2VyIjoiU1hYWFhCIiwic2Vzc2lvbklkIjoiNjllMzJhMDlhZmZhYjFlZWNiNjcyYTY3In0sImlhdCI6MTc3NzI2NDI1OSwic3ViIjoiL3NwYWNlcy9TWFhYWEIvTiIsImV4cCI6MTc3NzM1MDY1OSwiaXNzIjoiaHR0cHM6Ly9odWdnaW5nZmFjZS5jbyJ9.a2m5f-B2sq6ZvY_DylJK5p3H_O7806fW_7EtiVghvG7czXq_lwt9tNCrCXJor4iaDqCvg4Z4JkIiRE3JDiH0Bw HTTP/1.1" 200 -
