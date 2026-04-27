@@ -6,8 +6,11 @@ import shutil
 import tempfile
 import subprocess
 import logging
+import base64
+import hmac
+import hashlib
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from yt_dlp import YoutubeDL
 
 logging.basicConfig(level=logging.INFO)
@@ -507,16 +510,21 @@ def extract_media(url: str) -> dict:
       3) TikWM API — last-resort fallback (540p H.264 only).
     """
     if SERVERLESS_MODE:
+        # Try the web extractor first (720p HEVC native quality). The video
+        # URL is referer-locked so we'll wrap it in a proxy URL before
+        # handing it to Telegram (see handle_update).
+        try:
+            result = _extract_via_web(url)
+            if result and result.get("type") in ("video", "images"):
+                return result
+        except Exception as e:
+            logger.warning(f"web extractor failed in serverless mode: {e}")
+        # Fallback to TikWM (540p but reliable, no referer needed).
         try:
             return _extract_via_tikwm(url)
         except Exception as e:
-            logger.warning(f"TikWM failed in serverless mode: {e}")
-            # fall through to web scraper as a last attempt
-            try:
-                return _extract_via_web(url)
-            except Exception as e2:
-                logger.error(f"web extractor also failed: {e2}")
-                raise
+            logger.error(f"TikWM also failed: {e}")
+            raise
 
     try:
         result = _extract_via_web(url)
@@ -718,6 +726,47 @@ def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int 
             pass
 
 
+PROXY_SECRET = (
+    os.getenv("WEBHOOK_SECRET")
+    or os.getenv("SESSION_SECRET")
+    or (BOT_TOKEN or "fallback-secret")
+).encode()
+
+
+def _sign_proxy_url(src_url: str) -> str:
+    """Build a tamper-proof proxy URL pointing at /api/v/<token>.
+
+    The token contains the source URL plus an HMAC signature so nobody can
+    reuse our server to proxy arbitrary URLs.
+    """
+    raw = src_url.encode()
+    b64 = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    sig = hmac.new(PROXY_SECRET, raw, hashlib.sha256).hexdigest()[:16]
+    return f"{b64}.{sig}"
+
+
+def _verify_proxy_token(token: str) -> str | None:
+    try:
+        b64, sig = token.split(".", 1)
+        pad = "=" * (-len(b64) % 4)
+        raw = base64.urlsafe_b64decode(b64 + pad)
+        expected = hmac.new(PROXY_SECRET, raw, hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return raw.decode()
+    except Exception:
+        return None
+
+
+def _build_proxy_url(src_url: str) -> str | None:
+    """Return a public Render URL that proxies the TikTok CDN with Referer.
+    Returns None if WEBHOOK_URL is not configured (proxy unavailable)."""
+    base = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/api/v/{_sign_proxy_url(src_url)}"
+
+
 def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
     """Last-resort: hand the URL to Telegram. Quality may degrade because
     Telegram fetches without a proper Referer."""
@@ -806,10 +855,18 @@ def handle_update(update: dict):
         res = None
 
         if SERVERLESS_MODE:
-            # Lightweight URL-relay mode (Vercel / Netlify / Lambda).
-            # Telegram fetches the video itself — we never touch the bytes.
-            # Quality is 540p H.264 (TikWM's `play` URL works without Referer).
-            res = send_video_by_url(chat_id, media, reply_to=msg_id)
+            # Lightweight URL-relay mode. Telegram fetches the video itself.
+            # If the source URL needs a Referer header (web extractor → 720p
+            # HEVC native quality), wrap it in our /api/v/<token> proxy so
+            # Telegram fetches through us with the proper header. The proxy
+            # streams bytes without touching CPU/RAM.
+            relay_media = media
+            if media.get("needs_referer"):
+                proxied = _build_proxy_url(media["url"])
+                if proxied:
+                    relay_media = dict(media)
+                    relay_media["url"] = proxied
+            res = send_video_by_url(chat_id, relay_media, reply_to=msg_id)
         else:
             # Full mode: download → optional HEVC→H.264 transcode → upload.
             tmp_path = None
@@ -906,6 +963,62 @@ def set_webhook():
         payload["secret_token"] = secret
     res = tg("setWebhook", payload, timeout=10)
     return jsonify(res or {"ok": False}), 200
+
+
+@app.route("/api/v/<token>", methods=["GET", "HEAD"])
+def proxy_video(token):
+    """Stream a TikTok CDN video through Render with the proper Referer.
+
+    Telegram's URL fetcher does not send a Referer header, so TikTok's CDN
+    blocks it (or returns the lowest quality). We sit in the middle: we
+    forward Telegram's request to TikTok adding the required header, and
+    stream the bytes back. CPU cost is minimal (just copying bytes), but
+    bandwidth is consumed once per fetched video.
+    """
+    src = _verify_proxy_token(token)
+    if not src:
+        return jsonify({"ok": False, "error": "invalid token"}), 403
+
+    headers = {
+        "User-Agent": WEB_HEADERS["User-Agent"],
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+    }
+    rng = request.headers.get("Range")
+    if rng:
+        headers["Range"] = rng
+
+    try:
+        upstream = requests.get(src, headers=headers, stream=True, timeout=20)
+    except Exception as e:
+        logger.warning(f"proxy upstream error: {e}")
+        return jsonify({"ok": False, "error": "upstream"}), 502
+
+    if upstream.status_code not in (200, 206):
+        upstream.close()
+        return jsonify({"ok": False, "error": f"upstream {upstream.status_code}"}), 502
+
+    response_headers = {
+        "Content-Type": upstream.headers.get("Content-Type", "video/mp4"),
+        "Cache-Control": "public, max-age=3600",
+    }
+    for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
+        if h in upstream.headers:
+            response_headers[h] = upstream.headers[h]
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=upstream.status_code,
+        headers=response_headers,
+    )
 
 
 @app.route("/", methods=["GET"])
