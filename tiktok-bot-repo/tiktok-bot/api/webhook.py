@@ -769,7 +769,7 @@ def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int 
     data = {
         "chat_id": str(chat_id),
         "supports_streaming": "true",
-        "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+        "caption": "Tik : 1l.u",
     }
     if media.get("duration"):
         data["duration"] = str(int(media["duration"]))
@@ -855,7 +855,7 @@ def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
         "chat_id": chat_id,
         "video": media["url"],
         "supports_streaming": True,
-        "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+        "caption": "Tik : 1l.u",
     }
     if media.get("duration"):
         payload["duration"] = int(media["duration"])
@@ -879,13 +879,80 @@ def send_images_as_group(chat_id: int, images: list, reply_to: int = None):
         for idx, img in enumerate(chunk):
             item = {"type": "photo", "media": img}
             if i == 0 and idx == 0:
-                item["caption"] = "✅ تم التحميل"
+                item["caption"] = "Tik : 1l.u"
             media.append(item)
         payload = {"chat_id": chat_id, "media": media}
         if reply_to and i == 0:
             payload["reply_to_message_id"] = reply_to
         results.append(tg("sendMediaGroup", payload, timeout=20))
     return results
+
+
+class ProgressIndicator:
+    """Sends a placeholder message and animates a progress bar while the
+    actual download/upload runs in the foreground. The message is deleted
+    when stop_and_delete() is called, just before the video appears."""
+
+    def __init__(self, chat_id: int, reply_to: int = None):
+        self.chat_id = chat_id
+        self.reply_to = reply_to
+        self.msg_id = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def _render(pct: int) -> str:
+        bars = 10
+        filled = max(0, min(bars, round(pct / 100 * bars)))
+        bar = "▰" * filled + "▱" * (bars - filled)
+        return f"⏳ جاري التحميل\n{bar}  {pct}%"
+
+    def start(self):
+        payload = {
+            "chat_id": self.chat_id,
+            "text": self._render(15),
+            "disable_web_page_preview": True,
+        }
+        if self.reply_to:
+            payload["reply_to_message_id"] = self.reply_to
+        res = tg("sendMessage", payload, timeout=5)
+        self.msg_id = ((res or {}).get("result") or {}).get("message_id")
+        if self.msg_id:
+            self._thread = threading.Thread(target=self._tick, daemon=True)
+            self._thread.start()
+
+    def _tick(self):
+        # Animate fake progress while extraction/upload is in flight.
+        # Telegram rate-limits editMessage to ~1/sec per chat — we stay well
+        # under that.
+        for pct in (35, 60, 85):
+            if self._stop.wait(1.4):
+                return
+            try:
+                tg("editMessageText", {
+                    "chat_id": self.chat_id,
+                    "message_id": self.msg_id,
+                    "text": self._render(pct),
+                }, timeout=5)
+            except Exception:
+                return
+
+    def stop_and_delete(self):
+        self._stop.set()
+        if self._thread:
+            try:
+                self._thread.join(timeout=0.5)
+            except Exception:
+                pass
+        if self.msg_id:
+            try:
+                tg("deleteMessage", {
+                    "chat_id": self.chat_id,
+                    "message_id": self.msg_id,
+                }, timeout=5)
+            except Exception:
+                pass
+            self.msg_id = None
 
 
 def handle_update(update: dict):
@@ -931,7 +998,7 @@ def handle_update(update: dict):
                 "chat_id": chat_id,
                 "video": cached,
                 "supports_streaming": True,
-                "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+                "caption": "Tik : 1l.u",
             }
             if msg_id:
                 payload["reply_to_message_id"] = msg_id
@@ -942,9 +1009,13 @@ def handle_update(update: dict):
             logger.warning(f"file_id send failed, dropping cache for {video_id}: {res}")
             _cache_drop(video_id)
 
+    progress = ProgressIndicator(chat_id, reply_to=msg_id)
+    progress.start()
+
     try:
         media = extract_media(url)
     except Exception as e:
+        progress.stop_and_delete()
         logger.exception("extract_media failed")
         send_message(
             chat_id,
@@ -953,6 +1024,13 @@ def handle_update(update: dict):
         )
         return
 
+    try:
+        _dispatch_media(chat_id, msg_id, url, media, video_id, progress)
+    finally:
+        progress.stop_and_delete()
+
+
+def _dispatch_media(chat_id, msg_id, url, media, video_id, progress):
     if media["type"] == "video":
         res = None
 
