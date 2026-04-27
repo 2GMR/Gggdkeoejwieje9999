@@ -427,18 +427,11 @@ def _tikwm_call(url: str) -> dict | None:
             play_url = d.get("play")
             hd_url = d.get("hdplay")
             wm_url = d.get("wmplay")
-            play_size = d.get("size") or 0
-            hd_size = d.get("hd_size") or 0
 
-            video_url = None
-            if hd_url and hd_size and play_size and hd_size > play_size * 1.15:
-                video_url = hd_url
-            elif play_url:
-                video_url = play_url
-            elif hd_url:
-                video_url = hd_url
-            elif wm_url:
-                video_url = wm_url
+            # Always prefer hdplay when present — it returns 720p H.264 with
+            # no watermark, and the URL works without a Referer header so
+            # Telegram can fetch it directly (zero bandwidth on our server).
+            video_url = hd_url or play_url or wm_url
 
             if video_url:
                 return {
@@ -596,20 +589,22 @@ def extract_media(url: str) -> dict:
       3) TikWM API — last-resort fallback (540p H.264 only).
     """
     if SERVERLESS_MODE:
-        # Try the web extractor first (720p HEVC native quality). The video
-        # URL is referer-locked so we'll wrap it in a proxy URL before
-        # handing it to Telegram (see handle_update).
+        # 1) TikWM HD endpoint (`hdplay` URL) → 720p H.264, no Referer needed,
+        #    Telegram fetches it directly = ZERO bandwidth on our server.
+        #    This is the path we want for ~95% of requests.
         try:
-            result = _extract_via_web(url)
+            result = _extract_via_tikwm(url)
             if result and result.get("type") in ("video", "images"):
                 return result
         except Exception as e:
-            logger.warning(f"web extractor failed in serverless mode: {e}")
-        # Fallback to TikWM (540p but reliable, no referer needed).
+            logger.warning(f"TikWM failed, trying web extractor: {e}")
+        # 2) Web extractor → 720p HEVC native, but URL is Referer-locked so
+        #    we'll have to proxy it through Render (consumes bandwidth).
+        #    Only used when TikWM is unreachable or rate-limited.
         try:
-            return _extract_via_tikwm(url)
+            return _extract_via_web(url)
         except Exception as e:
-            logger.error(f"TikWM also failed: {e}")
+            logger.error(f"web extractor also failed: {e}")
             raise
 
     try:
