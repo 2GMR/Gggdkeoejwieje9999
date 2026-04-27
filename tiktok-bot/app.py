@@ -47,16 +47,42 @@ def health():
     return jsonify(ok=True)
 
 
+def _get_me():
+    """Identify which bot this token actually belongs to."""
+    for attempt in range(3):
+        try:
+            r = requests.get(f"{TELEGRAM_API}/getMe", timeout=15)
+            data = r.json()
+            if data.get("ok"):
+                u = data["result"]
+                logger.info(
+                    f"Connected to bot: @{u.get('username')} "
+                    f"(id={u.get('id')}, name={u.get('first_name')!r})"
+                )
+                return u
+            logger.error(f"getMe failed: {data}")
+            return None
+        except Exception as exc:
+            logger.warning(f"getMe attempt {attempt+1}/3 failed: {exc}")
+            time.sleep(3)
+    return None
+
+
 def _delete_webhook():
     """Polling and webhooks are mutually exclusive — clear any old webhook."""
-    try:
-        requests.post(
-            f"{TELEGRAM_API}/deleteWebhook",
-            json={"drop_pending_updates": False},
-            timeout=10,
-        )
-    except Exception as exc:
-        logger.warning(f"deleteWebhook failed: {exc}")
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{TELEGRAM_API}/deleteWebhook",
+                json={"drop_pending_updates": False},
+                timeout=15,
+            )
+            data = r.json()
+            logger.info(f"deleteWebhook: {data}")
+            return
+        except Exception as exc:
+            logger.warning(f"deleteWebhook attempt {attempt+1}/3 failed: {exc}")
+            time.sleep(3)
 
 
 def _polling_loop():
@@ -64,8 +90,13 @@ def _polling_loop():
         logger.error("BOT_TOKEN is not set — polling will not start.")
         return
 
+    me = _get_me()
+    if not me:
+        logger.error("Cannot identify bot. Check BOT_TOKEN secret.")
+        return
+
     _delete_webhook()
-    logger.info("Telegram long-polling started.")
+    logger.info("Telegram long-polling started. Send a TikTok link on Telegram.")
 
     offset = 0
     backoff = 1
@@ -78,14 +109,37 @@ def _polling_loop():
             )
             data = r.json()
             if not data.get("ok"):
+                # 401 = bad token, no point retrying.
+                if data.get("error_code") == 401:
+                    logger.error(
+                        "BOT_TOKEN is invalid (401). "
+                        "Update the secret in Space Settings and restart."
+                    )
+                    while True:
+                        time.sleep(3600)
+                # 409 = another instance is polling the same token.
+                if data.get("error_code") == 409:
+                    logger.error(
+                        "Conflict (409): another bot instance is polling. "
+                        "Stop the other instance (e.g. on Replit) and wait."
+                    )
                 logger.warning(f"getUpdates returned: {data}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
 
             backoff = 1
-            for update in data.get("result", []):
+            updates = data.get("result", [])
+            if updates:
+                logger.info(f"Received {len(updates)} update(s)")
+            for update in updates:
                 offset = update["update_id"] + 1
+                msg = update.get("message") or update.get("edited_message") or {}
+                text_preview = (msg.get("text") or "")[:80]
+                logger.info(
+                    f"Update {update['update_id']} from "
+                    f"chat={msg.get('chat',{}).get('id')} text={text_preview!r}"
+                )
                 try:
                     handle_update(update)
                 except Exception as exc:
