@@ -83,6 +83,18 @@ def poll():
             continue
 
         if not data.get("ok"):
+            # 401 Unauthorized = the BOT_TOKEN is invalid/revoked. No point
+            # in retrying — sleep silently so we don't spam the logs or
+            # Telegram's API. The workflow stays "running" but idle.
+            if data.get("error_code") == 401:
+                logger.error(
+                    "BOT_TOKEN is invalid/revoked (401). "
+                    "Update the secret on Replit OR stop this workflow. "
+                    "Sleeping forever to avoid log spam."
+                )
+                while True:
+                    time.sleep(3600)
+
             # 409 Conflict means another instance is polling. Exit so the
             # workflow restarts cleanly with a single instance.
             if data.get("error_code") == 409:
