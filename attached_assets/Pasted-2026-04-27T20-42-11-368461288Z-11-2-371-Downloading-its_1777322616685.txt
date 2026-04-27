@@ -1,0 +1,50 @@
+2026-04-27T20:42:11.368461288Z #11 2.371 Downloading itsdangerous-2.2.0-py3-none-any.whl (16 kB)
+2026-04-27T20:42:11.368463738Z #11 2.381 Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+2026-04-27T20:42:11.368466218Z #11 2.384    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 134.9/134.9 kB 303.0 MB/s eta 0:00:00
+2026-04-27T20:42:11.368468649Z #11 2.393 Downloading urllib3-2.6.3-py3-none-any.whl (131 kB)
+2026-04-27T20:42:11.368471198Z #11 2.395    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 131.6/131.6 kB 283.9 MB/s eta 0:00:00
+2026-04-27T20:42:11.368473669Z #11 2.404 Downloading werkzeug-3.1.8-py3-none-any.whl (226 kB)
+2026-04-27T20:42:11.368476149Z #11 2.407    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 226.5/226.5 kB 288.0 MB/s eta 0:00:00
+2026-04-27T20:42:11.368480099Z #11 2.416 Downloading markupsafe-3.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+2026-04-27T20:42:11.469648832Z #11 2.517 Installing collected packages: yt-dlp, urllib3, MarkupSafe, itsdangerous, idna, click, charset-normalizer, certifi, blinker, Werkzeug, requests, Jinja2, flask
+2026-04-27T20:42:13.687785829Z #11 4.735 Successfully installed Jinja2-3.1.6 MarkupSafe-3.0.3 Werkzeug-3.1.8 blinker-1.9.0 certifi-2026.4.22 charset-normalizer-3.4.7 click-8.3.3 flask-3.0.3 idna-3.13 itsdangerous-2.2.0 requests-2.32.3 urllib3-2.6.3 yt-dlp-2026.3.17
+2026-04-27T20:42:13.915928913Z #11 4.817 
+2026-04-27T20:42:13.915953553Z #11 4.817 [notice] A new release of pip is available: 24.0 -> 26.1
+2026-04-27T20:42:13.915977594Z #11 4.817 [notice] To update, run: pip install --upgrade pip
+2026-04-27T20:42:13.915983014Z #11 DONE 5.0s
+2026-04-27T20:42:14.166499802Z 
+2026-04-27T20:42:14.166556413Z #12 [7/7] COPY --chown=user . .
+2026-04-27T20:42:14.166563463Z #12 DONE 0.1s
+2026-04-27T20:42:14.166565723Z 
+2026-04-27T20:42:14.166568523Z #13 exporting to docker image format
+2026-04-27T20:42:14.166571063Z #13 exporting layers
+2026-04-27T20:42:28.039063016Z #13 exporting layers 14.0s done
+2026-04-27T20:42:28.214339282Z #13 exporting manifest sha256:5fdaae9f34fdd887d904a027321fac7de54ac3aca0cff8777cfbb70c504ba1fd done
+2026-04-27T20:42:28.214361692Z #13 exporting config sha256:42e770daedad27097bc2b02b5a025fbde1dc3002b19c1f1a1e7e56b214280429 done
+2026-04-27T20:42:29.633720955Z #13 DONE 15.6s
+2026-04-27T20:42:29.633745496Z 
+2026-04-27T20:42:29.633751836Z #14 exporting cache to client directory
+2026-04-27T20:42:29.633755316Z #14 preparing build cache for export
+2026-04-27T20:42:34.465250628Z #14 writing cache image manifest sha256:197701a7664644b2c63d73b313209a04d52325f13bf914ab5afd4238a5856412 done
+2026-04-27T20:42:34.465270089Z #14 DONE 4.8s
+2026-04-27T20:42:36.70885315Z Pushing image to registry...
+2026-04-27T20:42:43.710619363Z Upload succeeded
+2026-04-27T20:42:46.939602174Z ==> Deploying...
+2026-04-27T20:42:46.996528817Z ==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
+2026-04-27T20:43:03.392156256Z INFO:bot-app:Starting in WEBHOOK mode. After deploy, visit /api/setwebhook with WEBHOOK_URL set to your public HTTPS URL to register.
+2026-04-27T20:43:03.392366809Z  * Serving Flask app 'api.webhook'
+2026-04-27T20:43:03.392375929Z  * Debug mode: off
+2026-04-27T20:43:03.397376753Z INFO:werkzeug:WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+2026-04-27T20:43:03.397392443Z  * Running on all addresses (0.0.0.0)
+2026-04-27T20:43:03.397395393Z  * Running on http://127.0.0.1:10000
+2026-04-27T20:43:03.397397853Z  * Running on http://10.24.146.119:10000
+2026-04-27T20:43:03.397400533Z INFO:werkzeug:Press CTRL+C to quit
+2026-04-27T20:43:03.880230428Z INFO:werkzeug:127.0.0.1 - - [27/Apr/2026 20:43:03] "HEAD / HTTP/1.1" 200 -
+2026-04-27T20:43:09.054073448Z ==> Your service is live 🎉
+2026-04-27T20:43:09.168730071Z INFO:werkzeug:127.0.0.1 - - [27/Apr/2026 20:43:09] "GET / HTTP/1.1" 200 -
+2026-04-27T20:43:09.20570644Z ==> 
+2026-04-27T20:43:09.207896831Z ==> ///////////////////////////////////////////////////////////
+2026-04-27T20:43:09.209896387Z ==> 
+2026-04-27T20:43:09.212591793Z ==> Available at your primary URL https://gggdkeoejwieje9999.onrender.com
+2026-04-27T20:43:09.215122113Z ==> 
+2026-04-27T20:43:09.217305744Z ==> ///////////////////////////////////////////////////////////
