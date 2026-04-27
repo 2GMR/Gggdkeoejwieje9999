@@ -9,6 +9,7 @@ import logging
 import base64
 import hmac
 import hashlib
+import threading
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from yt_dlp import YoutubeDL
@@ -115,6 +116,91 @@ HELP = (
     "3️⃣ سأقوم بإرساله لك مباشرة بأعلى جودة\n\n"
     "🚀 لا توجد علامة مائية، وتحميل سريع جداً."
 )
+
+
+# ---------------------------------------------------------------------------
+# Telegram file_id cache
+# ---------------------------------------------------------------------------
+# Once Telegram has fetched a video, it stores it on its CDN and gives us a
+# `file_id`. Future requests for the same TikTok video can be served by
+# sending that file_id back — Telegram delivers the cached file directly,
+# zero bytes through our server. This is the single biggest bandwidth win
+# for viral content (e.g. trending videos requested by hundreds of users).
+_FILE_ID_CACHE: dict[str, str] = {}
+_FILE_ID_CACHE_LOCK = threading.Lock()
+_FILE_ID_CACHE_PATH = os.getenv("FILE_ID_CACHE_PATH", "/tmp/tiktok_file_id_cache.json")
+_FILE_ID_CACHE_MAX = int(os.getenv("FILE_ID_CACHE_MAX", "20000"))
+
+
+def _load_file_id_cache():
+    global _FILE_ID_CACHE
+    try:
+        with open(_FILE_ID_CACHE_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _FILE_ID_CACHE = data
+            logger.info(f"file_id cache: loaded {len(_FILE_ID_CACHE)} entries")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"file_id cache: load failed: {e}")
+
+
+def _save_file_id_cache():
+    try:
+        with _FILE_ID_CACHE_LOCK:
+            snapshot = dict(_FILE_ID_CACHE)
+        tmp_path = _FILE_ID_CACHE_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_path, _FILE_ID_CACHE_PATH)
+    except Exception as e:
+        logger.warning(f"file_id cache: save failed: {e}")
+
+
+def _extract_video_id(url: str) -> str | None:
+    """Return the canonical TikTok video ID (e.g. '7234567890123456789')."""
+    m = re.search(r"/video/(\d+)", url)
+    if m:
+        return m.group(1)
+    if any(d in url.lower() for d in ("vm.tiktok.com", "vt.tiktok.com")):
+        try:
+            canonical = _resolve_canonical_url(url)
+            m = re.search(r"/video/(\d+)", canonical or "")
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return None
+
+
+def _cache_get(video_id: str) -> str | None:
+    if not video_id:
+        return None
+    with _FILE_ID_CACHE_LOCK:
+        return _FILE_ID_CACHE.get(video_id)
+
+
+def _cache_set(video_id: str, file_id: str):
+    if not video_id or not file_id:
+        return
+    with _FILE_ID_CACHE_LOCK:
+        if len(_FILE_ID_CACHE) >= _FILE_ID_CACHE_MAX:
+            try:
+                first = next(iter(_FILE_ID_CACHE))
+                _FILE_ID_CACHE.pop(first, None)
+            except StopIteration:
+                pass
+        _FILE_ID_CACHE[video_id] = file_id
+    _save_file_id_cache()
+
+
+def _cache_drop(video_id: str):
+    if not video_id:
+        return
+    with _FILE_ID_CACHE_LOCK:
+        _FILE_ID_CACHE.pop(video_id, None)
+    _save_file_id_cache()
 
 
 def tg(method: str, payload: dict, timeout: int = 10):
@@ -840,6 +926,27 @@ def handle_update(update: dict):
 
     send_chat_action(chat_id, "upload_video")
 
+    # ---- Telegram file_id cache hit: serve instantly with zero bandwidth ----
+    video_id = _extract_video_id(url)
+    if video_id:
+        cached = _cache_get(video_id)
+        if cached:
+            logger.info(f"cache HIT video_id={video_id} → sending by file_id")
+            payload = {
+                "chat_id": chat_id,
+                "video": cached,
+                "supports_streaming": True,
+                "caption": "✅ تم التحميل\n\n@" + (os.getenv("BOT_USERNAME", "")),
+            }
+            if msg_id:
+                payload["reply_to_message_id"] = msg_id
+            res = tg("sendVideo", payload, timeout=15)
+            if res and res.get("ok"):
+                return
+            # Cached file_id may have expired or been deleted by Telegram.
+            logger.warning(f"file_id send failed, dropping cache for {video_id}: {res}")
+            _cache_drop(video_id)
+
     try:
         media = extract_media(url)
     except Exception as e:
@@ -901,6 +1008,16 @@ def handle_update(update: dict):
                 "⚠️ تعذّر إرسال الفيديو مباشرة. هذا هو الرابط المباشر:\n\n" + media["url"],
                 reply_to=msg_id,
             )
+        else:
+            # Capture Telegram's file_id so future requests for the same
+            # video are served from Telegram's CDN with zero bandwidth.
+            try:
+                file_id = (res.get("result") or {}).get("video", {}).get("file_id")
+                if file_id and video_id:
+                    _cache_set(video_id, file_id)
+                    logger.info(f"cached file_id for {video_id}")
+            except Exception:
+                pass
     elif media["type"] == "images":
         send_chat_action(chat_id, "upload_photo")
         send_images_as_group(chat_id, media["urls"], reply_to=msg_id)
@@ -1023,4 +1140,12 @@ def proxy_video(token):
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "ok", "service": "tiktok-bot"}), 200
+    return jsonify({
+        "status": "ok",
+        "service": "tiktok-bot",
+        "cached_videos": len(_FILE_ID_CACHE),
+    }), 200
+
+
+# Initialise the file_id cache on import (after the file path is known).
+_load_file_id_cache()
