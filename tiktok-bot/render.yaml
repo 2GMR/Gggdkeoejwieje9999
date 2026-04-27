@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: tiktok-bot
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_MODE
+        value: webhook
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: PORT
+        value: 10000
