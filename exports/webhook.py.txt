@@ -774,7 +774,7 @@ def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int 
     data = {
         "chat_id": str(chat_id),
         "supports_streaming": "true",
-        "caption": "TikTok : `l.u`",
+        "caption": "TikTok : `1l.u`",
         "parse_mode": "MarkdownV2",
     }
     if media.get("duration"):
@@ -861,7 +861,7 @@ def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
         "chat_id": chat_id,
         "video": media["url"],
         "supports_streaming": True,
-        "caption": "TikTok : `l.u`",
+        "caption": "TikTok : `1l.u`",
         "parse_mode": "MarkdownV2",
     }
     if media.get("duration"):
@@ -886,7 +886,7 @@ def send_images_as_group(chat_id: int, images: list, reply_to: int = None):
         for idx, img in enumerate(chunk):
             item = {"type": "photo", "media": img}
             if i == 0 and idx == 0:
-                item["caption"] = "TikTok : `l.u`"
+                item["caption"] = "TikTok : `1l.u`"
                 item["parse_mode"] = "MarkdownV2"
             media.append(item)
         payload = {"chat_id": chat_id, "media": media}
@@ -997,7 +997,7 @@ def handle_update(update: dict):
                 "chat_id": chat_id,
                 "video": cached,
                 "supports_streaming": True,
-                "caption": "TikTok : `l.u`",
+                "caption": "TikTok : `1l.u`",
         "parse_mode": "MarkdownV2",
             }
             if msg_id:
