@@ -434,13 +434,18 @@ def _tikwm_call(url: str) -> dict | None:
             video_url = hd_url or play_url or wm_url
 
             if video_url:
+                # TikWM doesn't always expose width/height; default to the
+                # standard TikTok vertical 720×1280. Passing explicit
+                # dimensions to Telegram avoids the "audio only / black
+                # frame" bug some clients hit when metadata is missing.
                 return {
                     "type": "video",
                     "url": video_url,
+                    "play_url": play_url,  # H.264 540p backup if HD fails
                     "title": d.get("title") or "",
                     "duration": int(d.get("duration") or 0),
-                    "width": 0,
-                    "height": 0,
+                    "width": 720,
+                    "height": 1280,
                     "thumbnail": d.get("cover") or d.get("origin_cover"),
                 }
         except Exception:
@@ -769,7 +774,8 @@ def send_video_by_file(chat_id: int, media: dict, file_path: str, reply_to: int 
     data = {
         "chat_id": str(chat_id),
         "supports_streaming": "true",
-        "caption": "Tik : 1l.u",
+        "caption": "TikTok : `1l.u`",
+        "parse_mode": "MarkdownV2",
     }
     if media.get("duration"):
         data["duration"] = str(int(media["duration"]))
@@ -855,7 +861,8 @@ def send_video_by_url(chat_id: int, media: dict, reply_to: int = None):
         "chat_id": chat_id,
         "video": media["url"],
         "supports_streaming": True,
-        "caption": "Tik : 1l.u",
+        "caption": "TikTok : `1l.u`",
+        "parse_mode": "MarkdownV2",
     }
     if media.get("duration"):
         payload["duration"] = int(media["duration"])
@@ -879,7 +886,8 @@ def send_images_as_group(chat_id: int, images: list, reply_to: int = None):
         for idx, img in enumerate(chunk):
             item = {"type": "photo", "media": img}
             if i == 0 and idx == 0:
-                item["caption"] = "Tik : 1l.u"
+                item["caption"] = "TikTok : `1l.u`"
+                item["parse_mode"] = "MarkdownV2"
             media.append(item)
         payload = {"chat_id": chat_id, "media": media}
         if reply_to and i == 0:
@@ -888,10 +896,13 @@ def send_images_as_group(chat_id: int, images: list, reply_to: int = None):
     return results
 
 
+PROGRESS_AUTO_HIDE_SECONDS = 4
+
+
 class ProgressIndicator:
-    """Sends a placeholder message and animates a progress bar while the
-    actual download/upload runs in the foreground. The message is deleted
-    when stop_and_delete() is called, just before the video appears."""
+    """Sends a simple "جاري التحميل ..." placeholder that auto-deletes after
+    a few seconds (independently of the actual upload). The same instance can
+    also be cancelled early via stop_and_delete() — whichever fires first."""
 
     def __init__(self, chat_id: int, reply_to: int = None):
         self.chat_id = chat_id
@@ -899,18 +910,12 @@ class ProgressIndicator:
         self.msg_id = None
         self._stop = threading.Event()
         self._thread = None
-
-    @staticmethod
-    def _render(pct: int) -> str:
-        bars = 10
-        filled = max(0, min(bars, round(pct / 100 * bars)))
-        bar = "▰" * filled + "▱" * (bars - filled)
-        return f"⏳ جاري التحميل\n{bar}  {pct}%"
+        self._lock = threading.Lock()
 
     def start(self):
         payload = {
             "chat_id": self.chat_id,
-            "text": self._render(15),
+            "text": "جاري التحميل ...",
             "disable_web_page_preview": True,
         }
         if self.reply_to:
@@ -918,24 +923,26 @@ class ProgressIndicator:
         res = tg("sendMessage", payload, timeout=5)
         self.msg_id = ((res or {}).get("result") or {}).get("message_id")
         if self.msg_id:
-            self._thread = threading.Thread(target=self._tick, daemon=True)
+            self._thread = threading.Thread(target=self._auto_delete, daemon=True)
             self._thread.start()
 
-    def _tick(self):
-        # Animate fake progress while extraction/upload is in flight.
-        # Telegram rate-limits editMessage to ~1/sec per chat — we stay well
-        # under that.
-        for pct in (35, 60, 85):
-            if self._stop.wait(1.4):
-                return
+    def _delete_once(self):
+        with self._lock:
+            mid = self.msg_id
+            self.msg_id = None
+        if mid:
             try:
-                tg("editMessageText", {
+                tg("deleteMessage", {
                     "chat_id": self.chat_id,
-                    "message_id": self.msg_id,
-                    "text": self._render(pct),
+                    "message_id": mid,
                 }, timeout=5)
             except Exception:
-                return
+                pass
+
+    def _auto_delete(self):
+        # Wait up to PROGRESS_AUTO_HIDE_SECONDS or until stop_and_delete fires.
+        self._stop.wait(PROGRESS_AUTO_HIDE_SECONDS)
+        self._delete_once()
 
     def stop_and_delete(self):
         self._stop.set()
@@ -944,15 +951,7 @@ class ProgressIndicator:
                 self._thread.join(timeout=0.5)
             except Exception:
                 pass
-        if self.msg_id:
-            try:
-                tg("deleteMessage", {
-                    "chat_id": self.chat_id,
-                    "message_id": self.msg_id,
-                }, timeout=5)
-            except Exception:
-                pass
-            self.msg_id = None
+        self._delete_once()
 
 
 def handle_update(update: dict):
@@ -998,7 +997,8 @@ def handle_update(update: dict):
                 "chat_id": chat_id,
                 "video": cached,
                 "supports_streaming": True,
-                "caption": "Tik : 1l.u",
+                "caption": "TikTok : `1l.u`",
+        "parse_mode": "MarkdownV2",
             }
             if msg_id:
                 payload["reply_to_message_id"] = msg_id
